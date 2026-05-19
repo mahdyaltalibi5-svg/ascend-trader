@@ -15,6 +15,7 @@ import { TradeBadge } from "@/components/ui/TradeBadge";
 import { SignalStrengthBar } from "@/components/ui/SignalStrengthBar";
 import { ChartSkeleton, TradeRowSkeleton, SignalCardSkeleton } from "@/components/ui/LoadingSkeleton";
 import { EquityChart } from "@/components/charts/EquityChart";
+import { TradingViewChart } from "@/components/charts/TradingViewChart";
 import { usePortfolio } from "@/hooks/usePortfolio";
 import { useTrades } from "@/hooks/useTrades";
 import { useRealtimeSignals, useRealtimeTrades } from "@/hooks/useRealtime";
@@ -22,11 +23,14 @@ import { createClient } from "@/lib/supabase/client";
 import { formatCurrency, pnlColor, cn } from "@/lib/utils";
 import type { Signal } from "@/types";
 
+const WATCHLIST = ["SPY", "NVDA", "AAPL", "TSLA", "MSFT", "AMZN"];
+
 export default function DashboardPage() {
   const { portfolio, snapshots, loading: portfolioLoading } = usePortfolio();
   const { trades, loading: tradesLoading, refetch: refetchTrades } = useTrades({ status: "open", limit: 8 });
   const [signals, setSignals] = useState<Signal[]>([]);
   const [sigLoading, setSigLoading] = useState(true);
+  const [marketSymbol, setMarketSymbol] = useState(WATCHLIST[0]);
 
   const supabase = createClient();
 
@@ -140,6 +144,33 @@ export default function DashboardPage() {
             ? <ChartSkeleton height={260} />
             : <EquityChart snapshots={snapshots} height={260} />
           }
+        </div>
+
+        {/* Live Market Chart */}
+        <div className="glass rounded-2xl p-5">
+          <div className="mb-4 flex items-center justify-between">
+            <div>
+              <h2 className="font-space text-sm font-semibold text-primary">Live Market</h2>
+              <p className="text-xs text-muted">Real-time via TradingView</p>
+            </div>
+            <div className="flex gap-1.5">
+              {WATCHLIST.map((s) => (
+                <button
+                  key={s}
+                  onClick={() => setMarketSymbol(s)}
+                  className={cn(
+                    "rounded-lg px-3 py-1 text-xs font-semibold font-space transition-colors",
+                    marketSymbol === s
+                      ? "bg-cyan/10 text-cyan ring-1 ring-cyan/20"
+                      : "text-muted hover:text-primary"
+                  )}
+                >
+                  {s}
+                </button>
+              ))}
+            </div>
+          </div>
+          <TradingViewChart symbol={marketSymbol} interval="15" height={420} />
         </div>
 
         {/* Bottom split */}

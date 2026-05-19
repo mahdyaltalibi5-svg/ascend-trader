@@ -1,10 +1,10 @@
 "use client";
 
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Search, ChevronDown, Brain, Clock, BarChart2, ArrowLeftRight } from "lucide-react";
 import { TradeBadge } from "@/components/ui/TradeBadge";
-import { CandleChart } from "@/components/charts/CandleChart";
+import { TradingViewChart } from "@/components/charts/TradingViewChart";
 import { TradeRowSkeleton } from "@/components/ui/LoadingSkeleton";
 import { useTrades } from "@/hooks/useTrades";
 import { formatCurrency, pnlColor, cn } from "@/lib/utils";
@@ -67,11 +67,11 @@ function ExpandedRow({ trade }: { trade: Trade }) {
             {trade.symbol} Chart
           </p>
           <div className="rounded-xl overflow-hidden border border-white/[0.06]">
-            <CandleChart
-              candles={[]}
-              entryPrice={trade.entry_price ?? undefined}
-              exitPrice={trade.exit_price ?? undefined}
-              height={220}
+            <TradingViewChart
+              symbol={trade.symbol}
+              interval="15"
+              height={260}
+              showToolbar={false}
             />
           </div>
         </div>
