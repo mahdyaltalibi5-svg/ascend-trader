@@ -1,12 +1,12 @@
 """
-Ascend Trader Elite — AI-powered algorithmic trading bot.
-Multi-timeframe technical analysis + news sentiment + Claude AI.
+Ascend Trader Elite v3 — Maximum performance AI trading bot.
+Multi-timeframe analysis + live position management + trailing stops +
+circuit breaker + news sentiment + composite signal scoring.
 """
 
 import os
 import json
 import asyncio
-import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,7 +17,6 @@ import pandas_ta as ta
 import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from supabase import create_client, Client
 import anthropic
 from dotenv import load_dotenv
@@ -27,22 +26,30 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+# Expanded watchlist — mega caps + high-beta + crypto-adjacent + volatile growth
 WATCHLIST = [
-    # Mega caps
-    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
-    # High momentum tech
-    "AMD", "PLTR", "COIN", "HOOD", "MSTR", "CRWD", "PANW",
-    # ETFs for macro view
-    "SPY", "QQQ", "IWM",
-    # Volatile opportunities
-    "SMCI", "ARM", "SOFI", "RIVN",
+    # Mega cap (high liquidity, big moves on catalysts)
+    "NVDA", "TSLA", "AAPL", "MSFT", "META", "AMZN", "GOOGL",
+    # High-beta tech (2-5% daily moves common)
+    "AMD", "PLTR", "SMCI", "ARM", "CRWD", "PANW", "SOFI",
+    # Crypto-adjacent (follow BTC, very volatile)
+    "COIN", "HOOD", "MSTR", "MARA", "RIOT",
+    # Volatile growth
+    "IONQ", "RKLB", "RXRX", "ACHR",
 ]
 
-MAX_POSITIONS      = 5
-RISK_PER_TRADE     = 0.015   # risk 1.5% of portfolio per trade
-MIN_CONFIDENCE     = 0.72    # only trade signals above 72% confidence
-SCAN_INTERVAL_SECS = 300     # scan every 5 minutes
-BATCH_SIZE         = 5       # symbols per concurrent batch (rate limit safety)
+# Regime detection only — not traded
+REGIME_SYMBOLS = ["SPY", "QQQ"]
+
+MAX_POSITIONS       = 6       # max simultaneous open trades
+RISK_PER_TRADE      = 0.02    # risk 2% of portfolio per trade
+MIN_CONFIDENCE      = 0.70    # minimum AI confidence to execute
+MIN_RR              = 2.0     # minimum risk/reward ratio accepted
+MAX_DAILY_LOSS_PCT  = 0.04    # circuit breaker: stop at -4% daily
+SCAN_INTERVAL_SECS  = 300     # full market scan every 5 minutes
+MONITOR_INTERVAL    = 90      # position check every 90 seconds
+BATCH_SIZE          = 5       # symbols per concurrent batch
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -64,23 +71,29 @@ ALPACA_HEADERS   = {
 # State
 # ---------------------------------------------------------------------------
 bot_state = {
-    "running":        False,
-    "strategy":       "ascend_elite",
-    "last_scan_at":   None,
-    "last_signal_at": None,
-    "trades_today":   0,
-    "signals_today":  0,
-    "win_rate":       0.0,
-    "started_at":     None,
-    "scan_count":     0,
+    "running":                 False,
+    "circuit_breaker_active":  False,
+    "strategy":                "ascend_elite_v3",
+    "last_scan_at":            None,
+    "last_signal_at":          None,
+    "last_monitor_at":         None,
+    "trades_today":            0,
+    "signals_today":           0,
+    "wins_today":              0,
+    "losses_today":            0,
+    "win_rate":                0.0,
+    "day_pnl":                 0.0,
+    "started_at":              None,
+    "scan_count":              0,
 }
 
-scan_task: Optional[asyncio.Task] = None
+scan_task:    Optional[asyncio.Task] = None
+monitor_task: Optional[asyncio.Task] = None
 
 # ---------------------------------------------------------------------------
 # Alpaca helpers
 # ---------------------------------------------------------------------------
-async def alpaca_get(path: str, base: str = ALPACA_TRADE_URL) -> dict:
+async def alpaca_get(path: str, base: str = ALPACA_TRADE_URL) -> dict | list:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{base}{path}", headers=ALPACA_HEADERS)
         r.raise_for_status()
@@ -94,6 +107,12 @@ async def alpaca_post(path: str, payload: dict) -> dict:
         )
         r.raise_for_status()
         return r.json()
+
+
+async def alpaca_delete(path: str) -> bool:
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.delete(f"{ALPACA_TRADE_URL}{path}", headers=ALPACA_HEADERS)
+        return r.status_code in (200, 204)
 
 # ---------------------------------------------------------------------------
 # Market data
@@ -131,25 +150,24 @@ async def fetch_news(symbol: str) -> list[dict]:
 def compute_indicators(df: pd.DataFrame) -> dict:
     if df.empty or len(df) < 22:
         return {}
-
     try:
         close  = df["close"]
         high   = df["high"]
         low    = df["low"]
         volume = df["volume"]
 
-        rsi_s  = ta.rsi(close, length=14)
-        rsi    = float(rsi_s.iloc[-1]) if rsi_s is not None and not rsi_s.isna().all() else None
+        rsi_s     = ta.rsi(close, length=14)
+        rsi       = float(rsi_s.iloc[-1]) if rsi_s is not None and not rsi_s.isna().all() else None
 
         macd_df   = ta.macd(close, fast=12, slow=26, signal=9)
         macd_val  = float(macd_df["MACD_12_26_9"].iloc[-1])  if macd_df is not None else None
         macd_sig  = float(macd_df["MACDs_12_26_9"].iloc[-1]) if macd_df is not None else None
         macd_hist = float(macd_df["MACDh_12_26_9"].iloc[-1]) if macd_df is not None else None
 
-        bb_df     = ta.bbands(close, length=20, std=2)
-        bb_upper  = float(bb_df["BBU_20_2.0"].iloc[-1]) if bb_df is not None else None
-        bb_lower  = float(bb_df["BBL_20_2.0"].iloc[-1]) if bb_df is not None else None
-        bb_pct    = float(bb_df["BBP_20_2.0"].iloc[-1]) if bb_df is not None else None
+        bb_df    = ta.bbands(close, length=20, std=2)
+        bb_upper = float(bb_df["BBU_20_2.0"].iloc[-1]) if bb_df is not None else None
+        bb_lower = float(bb_df["BBL_20_2.0"].iloc[-1]) if bb_df is not None else None
+        bb_pct   = float(bb_df["BBP_20_2.0"].iloc[-1]) if bb_df is not None else None
 
         ema9  = float(ta.ema(close, length=9).iloc[-1])
         ema21 = float(ta.ema(close, length=21).iloc[-1])
@@ -161,12 +179,18 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         stoch_df = ta.stoch(high, low, close, k=14, d=3)
         stoch_k  = float(stoch_df["STOCHk_14_3_3"].iloc[-1]) if stoch_df is not None else None
 
+        # VWAP (intraday proxy using available bars)
+        vwap = float((close * volume).cumsum().iloc[-1] / volume.cumsum().iloc[-1])
+
         vol_sma   = float(volume.rolling(20).mean().iloc[-1])
         vol_ratio = float(volume.iloc[-1]) / vol_sma if vol_sma > 0 else 1.0
 
-        price     = float(close.iloc[-1])
-        prev      = float(close.iloc[-2]) if len(close) > 1 else price
-        chg_pct   = (price - prev) / prev * 100
+        # Rate of change (5-bar momentum)
+        roc5 = float((close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100) if len(close) >= 6 else 0.0
+
+        price   = float(close.iloc[-1])
+        prev    = float(close.iloc[-2]) if len(close) > 1 else price
+        chg_pct = (price - prev) / prev * 100
 
         ema_trend = (
             "bullish" if ema9 > ema21 > ema50
@@ -175,30 +199,35 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         )
 
         return {
-            "price":          round(price, 4),
-            "change_pct":     round(chg_pct, 3),
-            "rsi":            round(rsi, 2)    if rsi    is not None else None,
-            "macd":           round(macd_val, 4)  if macd_val  is not None else None,
-            "macd_signal":    round(macd_sig, 4)  if macd_sig  is not None else None,
-            "macd_histogram": round(macd_hist, 4) if macd_hist is not None else None,
-            "macd_bullish":   (macd_val > macd_sig) if (macd_val and macd_sig) else None,
-            "bb_upper":       round(bb_upper, 4) if bb_upper is not None else None,
-            "bb_lower":       round(bb_lower, 4) if bb_lower is not None else None,
-            "bb_position_pct": round(bb_pct * 100, 1) if bb_pct is not None else None,
-            "ema9":           round(ema9, 4),
-            "ema21":          round(ema21, 4),
-            "ema50":          round(ema50, 4),
-            "ema_trend":      ema_trend,
-            "above_ema9":     price > ema9,
-            "above_ema21":    price > ema21,
-            "above_ema50":    price > ema50,
-            "atr":            round(atr, 4)   if atr   is not None else None,
-            "atr_pct":        round(atr / price * 100, 3) if atr else None,
-            "volume_ratio":   round(vol_ratio, 2),
-            "high_volume":    vol_ratio > 1.5,
-            "stoch_k":        round(stoch_k, 2) if stoch_k is not None else None,
-            "oversold":       rsi < 35 if rsi else False,
-            "overbought":     rsi > 70 if rsi else False,
+            "price":             round(price, 4),
+            "change_pct":        round(chg_pct, 3),
+            "roc5":              round(roc5, 3),
+            "rsi":               round(rsi, 2)       if rsi       is not None else None,
+            "macd":              round(macd_val, 4)   if macd_val  is not None else None,
+            "macd_signal":       round(macd_sig, 4)   if macd_sig  is not None else None,
+            "macd_histogram":    round(macd_hist, 4)  if macd_hist is not None else None,
+            "macd_bullish":      (macd_val > macd_sig) if (macd_val and macd_sig) else None,
+            "macd_hist_growing": (macd_hist > 0)       if macd_hist is not None else None,
+            "bb_upper":          round(bb_upper, 4) if bb_upper is not None else None,
+            "bb_lower":          round(bb_lower, 4) if bb_lower is not None else None,
+            "bb_pct":            round(bb_pct * 100, 1) if bb_pct is not None else None,
+            "vwap":              round(vwap, 4),
+            "above_vwap":        price > vwap,
+            "ema9":              round(ema9, 4),
+            "ema21":             round(ema21, 4),
+            "ema50":             round(ema50, 4),
+            "ema_trend":         ema_trend,
+            "above_ema9":        price > ema9,
+            "above_ema21":       price > ema21,
+            "above_ema50":       price > ema50,
+            "atr":               round(atr, 4) if atr is not None else None,
+            "atr_pct":           round(atr / price * 100, 3) if atr else None,
+            "volume_ratio":      round(vol_ratio, 2),
+            "high_volume":       vol_ratio > 1.5,
+            "institutional_vol": vol_ratio > 2.5,
+            "stoch_k":           round(stoch_k, 2) if stoch_k is not None else None,
+            "oversold":          (rsi < 35) if rsi else False,
+            "overbought":        (rsi > 70) if rsi else False,
         }
     except Exception as e:
         return {"error": str(e)}
@@ -207,12 +236,8 @@ def compute_indicators(df: pd.DataFrame) -> dict:
 def mtf_trend(ind_5m: dict, ind_1h: dict, ind_1d: dict) -> str:
     scores = []
     for ind in [ind_5m, ind_1h, ind_1d]:
-        if ind.get("ema_trend") == "bullish":
-            scores.append(1)
-        elif ind.get("ema_trend") == "bearish":
-            scores.append(-1)
-        else:
-            scores.append(0)
+        t = ind.get("ema_trend")
+        scores.append(1 if t == "bullish" else -1 if t == "bearish" else 0)
     s = sum(scores)
     if   s >= 2:  return "strong_bull"
     elif s == 1:  return "mild_bull"
@@ -220,25 +245,49 @@ def mtf_trend(ind_5m: dict, ind_1h: dict, ind_1d: dict) -> str:
     elif s == -1: return "mild_bear"
     return "neutral"
 
+
+def composite_score(signal: dict, ind_5m: dict, ind_1h: dict) -> float:
+    """Rank signals beyond just confidence — reward volume + momentum alignment."""
+    conf       = signal.get("confidence", 0)
+    vol_ratio  = ind_1h.get("volume_ratio", 1.0)
+    roc        = abs(ind_5m.get("roc5", 0))
+    rr         = signal.get("risk_reward_ratio", 1.0)
+    bonus_vol  = min(vol_ratio / 5.0, 0.15)   # up to +15% for high volume
+    bonus_mom  = min(roc / 20.0, 0.10)        # up to +10% for strong momentum
+    bonus_rr   = min((rr - MIN_RR) / 10.0, 0.10)  # up to +10% for great R/R
+    return conf + bonus_vol + bonus_mom + bonus_rr
+
 # ---------------------------------------------------------------------------
 # Market regime
 # ---------------------------------------------------------------------------
 async def get_market_regime() -> dict:
     try:
-        spy_bars = await fetch_bars("SPY", "1Hour", 50)
-        ind      = compute_indicators(spy_bars)
-        regime   = "neutral"
-        if ind.get("ema_trend") == "bullish" and (ind.get("rsi") or 50) > 50:
+        spy_bars, qqq_bars = await asyncio.gather(
+            fetch_bars("SPY", "1Hour", 50),
+            fetch_bars("QQQ", "1Hour", 50),
+        )
+        spy = compute_indicators(spy_bars)
+        qqq = compute_indicators(qqq_bars)
+
+        regime = "neutral"
+        if spy.get("ema_trend") == "bullish" and (spy.get("rsi") or 50) > 50:
             regime = "bull"
-        elif ind.get("ema_trend") == "bearish" and (ind.get("rsi") or 50) < 50:
+        elif spy.get("ema_trend") == "bearish" and (spy.get("rsi") or 50) < 50:
             regime = "bear"
+
+        # Both SPY and QQQ bearish = confirmed bear
+        if spy.get("ema_trend") == "bearish" and qqq.get("ema_trend") == "bearish":
+            regime = "bear"
+
         return {
             "regime":        regime,
-            "spy_rsi":       ind.get("rsi"),
-            "spy_trend":     ind.get("ema_trend"),
-            "spy_price":     ind.get("price"),
-            "spy_change":    ind.get("change_pct"),
-            "spy_vol_ratio": ind.get("volume_ratio"),
+            "spy_rsi":       spy.get("rsi"),
+            "spy_trend":     spy.get("ema_trend"),
+            "spy_price":     spy.get("price"),
+            "spy_change":    spy.get("change_pct"),
+            "spy_vol_ratio": spy.get("volume_ratio"),
+            "qqq_trend":     qqq.get("ema_trend"),
+            "qqq_rsi":       qqq.get("rsi"),
         }
     except Exception:
         return {"regime": "unknown"}
@@ -263,77 +312,100 @@ async def analyze_with_claude(
         for n in news[:6]
     ) or "No recent news."
 
-    prompt = f"""You are an elite quantitative hedge fund trader with 20 years of experience. Your mandate is exceptional risk-adjusted returns. Analyze this opportunity and make a decisive, data-driven trading decision.
+    prompt = f"""You are the head trader at an elite quantitative hedge fund. You manage a high-conviction momentum portfolio. Your mandate: find asymmetric opportunities with exceptional risk/reward. You do not trade mediocre setups.
 
 ## MARKET CONTEXT
-Regime: {market_regime.get('regime', 'unknown').upper()} | SPY trend: {market_regime.get('spy_trend')} | SPY RSI: {market_regime.get('spy_rsi')} | SPY Δ: {market_regime.get('spy_change')}%
+Regime: {market_regime.get('regime', 'unknown').upper()}
+SPY: trend={market_regime.get('spy_trend')} | RSI={market_regime.get('spy_rsi')} | Δ={market_regime.get('spy_change')}% | vol={market_regime.get('spy_vol_ratio')}x
+QQQ: trend={market_regime.get('qqq_trend')} | RSI={market_regime.get('qqq_rsi')}
 
-## SYMBOL: {symbol}
+## TARGET: {symbol}
 Multi-Timeframe Alignment: {trend.upper()}
 
-### 5-Minute (momentum / entry timing)
+### 5-Minute (entry timing & immediate momentum)
 {json.dumps(ind_5m, indent=2)}
 
-### 1-Hour (trend confirmation)
+### 1-Hour (trend confirmation & institutional flow)
 {json.dumps(ind_1h, indent=2)}
 
-### Daily (macro structure / key levels)
+### Daily (macro structure & key levels)
 {json.dumps(ind_1d, indent=2)}
 
-## NEWS & CATALYSTS (last 24h)
+## NEWS & CATALYSTS
 {news_text}
 
-## PORTFOLIO
-Value: ${portfolio_value:,.0f} | Open positions: {open_positions}/{MAX_POSITIONS} | Risk/trade: {RISK_PER_TRADE*100}%
+## PORTFOLIO STATE
+Value: ${portfolio_value:,.0f} | Open: {open_positions}/{MAX_POSITIONS} | Risk/trade: {RISK_PER_TRADE*100}%
 
-## ANALYSIS CRITERIA
-Score each factor before deciding:
-1. MTF trend alignment — are 5m + 1h + daily all pointing the same direction?
-2. Volume confirmation — is volume_ratio > 1.5? (Institutional participation)
-3. RSI positioning — long: 40-65, short: 35-60 (avoid extremes)
-4. MACD momentum — histogram expanding in trade direction?
-5. Bollinger position — near lower band for longs, upper for shorts?
-6. News sentiment — does news support or oppose the directional bias?
-7. Market regime — trading with or against the broader market?
+## SCORING CRITERIA — score each honestly
+1. MTF TREND: All 3 timeframes pointing same direction? (5m+1h+daily EMAs aligned)
+2. VOLUME CONFIRMATION: volume_ratio > 1.5x? Institutional participation?
+3. RSI POSITIONING: Long zone 35-65 | Short zone 35-65 (avoid extremes >75 or <25)
+4. MACD MOMENTUM: macd_histogram growing in trade direction?
+5. PRICE STRUCTURE: Above VWAP + ema21 for longs | Below for shorts?
+6. NEWS CATALYST: Does recent news provide a fundamental reason?
+7. REGIME ALIGNMENT: Trading WITH the market direction?
 
-ONLY trade when at least 5 of 7 criteria align. Quality over quantity.
+## RULES
+- Need 5+ of 7 criteria to trade. Quality > quantity.
+- Minimum R/R: {MIN_RR}:1 (stop loss must be tight, target must be realistic)
+- Stop loss: use ATR-based (1.0-1.5x ATR from entry)
+- Take profit: minimum {MIN_RR}x the stop distance
+- In BEAR regime: only take short signals or hold
+- In BULL regime: prioritize long signals
+- If RSI > 75 for a long setup: confidence penalty — overstretched
+- High volume (>2.5x) on breakouts = institutional buying = higher confidence
 
-## RESPONSE — return ONLY valid JSON, no markdown:
+Return ONLY valid JSON, no markdown fences:
 {{
   "signal": "buy" | "sell" | "hold",
   "confidence": 0.0-1.0,
+  "criteria_met": 0-7,
   "entry_price": number,
   "stop_loss": number,
   "take_profit": number,
   "risk_reward_ratio": number,
-  "position_size_pct": 0.01-0.05,
-  "reasoning": "2-3 sentence professional analysis citing specific indicator values",
+  "position_size_pct": 0.01-0.04,
+  "reasoning": "2-3 sentences citing specific indicator values and why this is a high-conviction setup",
   "key_catalysts": ["catalyst1", "catalyst2"],
   "timeframe": "scalp|swing",
-  "invalidation": "specific price level or condition that invalidates thesis"
-}}
+  "invalidation": "specific price level that invalidates this thesis",
+  "criteria_breakdown": {{
+    "mtf_trend": true|false,
+    "volume_confirmation": true|false,
+    "rsi_position": true|false,
+    "macd_momentum": true|false,
+    "price_structure": true|false,
+    "news_catalyst": true|false,
+    "regime_alignment": true|false
+  }}
+}}"""
 
-If fewer than 5 criteria align, return signal: "hold". Never force a trade. Patience is edge."""
+    # Retry up to 3 times on JSON parse error
+    for attempt in range(3):
+        try:
+            response = claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=1000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text.strip())
+        except json.JSONDecodeError:
+            if attempt == 2:
+                return {"signal": "hold", "confidence": 0, "reasoning": "JSON parse failed after 3 attempts"}
+            await asyncio.sleep(1)
 
-    response = claude.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=900,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = response.content[0].text.strip()
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    text = text.strip()
-
-    return json.loads(text)
+    return {"signal": "hold", "confidence": 0}
 
 # ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
-def calc_qty(portfolio_value: float, entry: float, stop_loss: float) -> int:
+def calc_qty(portfolio_value: float, entry: float, stop_loss: float, atr: Optional[float] = None) -> int:
     risk_dollars   = portfolio_value * RISK_PER_TRADE
     risk_per_share = abs(entry - stop_loss)
     if risk_per_share <= 0:
@@ -343,6 +415,29 @@ def calc_qty(portfolio_value: float, entry: float, stop_loss: float) -> int:
     return max(1, min(shares, max_shares))
 
 # ---------------------------------------------------------------------------
+# Circuit breaker
+# ---------------------------------------------------------------------------
+async def check_circuit_breaker(account: dict) -> bool:
+    """Halt trading if daily loss exceeds MAX_DAILY_LOSS_PCT."""
+    equity     = float(account.get("equity", 0))
+    last_eq    = float(account.get("last_equity", equity))
+    day_loss   = (equity - last_eq) / last_eq if last_eq > 0 else 0
+
+    bot_state["day_pnl"] = day_loss * 100
+
+    if day_loss < -MAX_DAILY_LOSS_PCT:
+        if not bot_state["circuit_breaker_active"]:
+            bot_state["circuit_breaker_active"] = True
+            await log_bot(
+                f"🚨 CIRCUIT BREAKER: Daily loss {day_loss*100:.2f}% exceeds limit of {MAX_DAILY_LOSS_PCT*100}%. Halting new trades.",
+                "error",
+            )
+        return True
+
+    bot_state["circuit_breaker_active"] = False
+    return False
+
+# ---------------------------------------------------------------------------
 # Trade execution
 # ---------------------------------------------------------------------------
 async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]:
@@ -350,27 +445,28 @@ async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]
         return None
     if signal.get("confidence", 0) < MIN_CONFIDENCE:
         return None
+    if signal.get("risk_reward_ratio", 0) < MIN_RR:
+        return None
 
-    symbol    = signal["symbol"]
-    side      = signal["signal"]
-    entry     = signal["entry_price"]
-    stop      = signal["stop_loss"]
-    target    = signal["take_profit"]
+    symbol = signal["symbol"]
+    side   = signal["signal"]
+    entry  = signal["entry_price"]
+    stop   = signal["stop_loss"]
+    target = signal["take_profit"]
 
     qty = calc_qty(portfolio_value, entry, stop)
     if qty <= 0:
         return None
 
-    # Bracket order: market entry + automatic stop loss + take profit
     payload = {
-        "symbol":         symbol,
-        "qty":            str(qty),
-        "side":           side,
-        "type":           "market",
-        "time_in_force":  "day",
-        "order_class":    "bracket",
-        "stop_loss":      {"stop_price":   str(round(stop,   2))},
-        "take_profit":    {"limit_price":  str(round(target, 2))},
+        "symbol":        symbol,
+        "qty":           str(qty),
+        "side":          side,
+        "type":          "market",
+        "time_in_force": "day",
+        "order_class":   "bracket",
+        "stop_loss":     {"stop_price":  str(round(stop,   2))},
+        "take_profit":   {"limit_price": str(round(target, 2))},
     }
 
     order = await alpaca_post("/v2/orders", payload)
@@ -381,15 +477,159 @@ async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]
         "qty":              qty,
         "entry_price":      entry,
         "stop_loss":        stop,
+        "exit_price":       target,
         "status":           "open",
-        "strategy":         "ascend_elite",
-        "confidence_score": signal["confidence"],
+        "strategy":         "ascend_elite_v3",
+        "confidence_score": signal.get("confidence"),
         "ai_reasoning":     signal.get("reasoning", ""),
         "created_at":       datetime.now(timezone.utc).isoformat(),
     }).execute()
 
     bot_state["trades_today"] += 1
     return order
+
+# ---------------------------------------------------------------------------
+# Position monitor — trailing stops + P&L sync
+# ---------------------------------------------------------------------------
+async def monitor_positions():
+    """Run every MONITOR_INTERVAL seconds. Manage open positions actively."""
+    try:
+        positions_resp = await alpaca_get("/v2/positions")
+        if not isinstance(positions_resp, list) or not positions_resp:
+            return
+
+        open_orders = await alpaca_get("/v2/orders?status=open&limit=200")
+        if not isinstance(open_orders, list):
+            open_orders = []
+
+        for pos in positions_resp:
+            symbol  = pos["symbol"]
+            qty     = abs(int(float(pos["qty"])))
+            side    = pos["side"]          # "long" or "short"
+            entry   = float(pos["avg_entry_price"])
+            current = float(pos["current_price"])
+            unreal  = float(pos["unrealized_pl"])
+
+            # Fetch original trade record for stop/target
+            res = (
+                supabase.table("trades")
+                .select("stop_loss, exit_price, id")
+                .eq("symbol", symbol)
+                .eq("status", "open")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if not res.data:
+                continue
+
+            trade      = res.data[0]
+            orig_stop  = trade.get("stop_loss")
+            orig_target = trade.get("exit_price")
+
+            if not orig_stop:
+                continue
+
+            initial_risk = abs(entry - orig_stop)
+            if initial_risk <= 0:
+                continue
+
+            # How many R multiples have we achieved?
+            if side == "long":
+                gain   = current - entry
+                rr     = gain / initial_risk
+                new_stop = None
+                if rr >= 2.0:
+                    new_stop = entry + initial_risk           # lock in 1R profit
+                elif rr >= 1.0:
+                    new_stop = entry + 0.02                   # move to break-even
+
+                if new_stop and new_stop > orig_stop:
+                    await _replace_stop(symbol, qty, "sell", new_stop, open_orders, orig_stop)
+
+            elif side == "short":
+                gain   = entry - current
+                rr     = gain / initial_risk
+                new_stop = None
+                if rr >= 2.0:
+                    new_stop = entry - initial_risk
+                elif rr >= 1.0:
+                    new_stop = entry - 0.02
+
+                if new_stop and new_stop < orig_stop:
+                    await _replace_stop(symbol, qty, "buy", new_stop, open_orders, orig_stop)
+
+            # Sync live P&L to Supabase
+            supabase.table("trades").update({"pnl": round(unreal, 2)}).eq("id", trade["id"]).execute()
+
+        bot_state["last_monitor_at"] = datetime.now(timezone.utc).isoformat()
+
+    except Exception as e:
+        await log_bot(f"Position monitor error: {e}", "error")
+
+
+async def _replace_stop(
+    symbol: str, qty: int, stop_side: str,
+    new_stop: float, open_orders: list, old_stop: float,
+):
+    """Cancel existing stop order and submit a tighter one."""
+    # Find stop child orders for this symbol
+    stops = [
+        o for o in open_orders
+        if o.get("symbol") == symbol
+        and o.get("type") == "stop"
+        and o.get("side") == stop_side
+    ]
+    for o in stops:
+        try:
+            await alpaca_delete(f"/v2/orders/{o['id']}")
+        except Exception:
+            pass
+
+    # Submit new stop
+    try:
+        await alpaca_post("/v2/orders", {
+            "symbol":        symbol,
+            "qty":           str(qty),
+            "side":          stop_side,
+            "type":          "stop",
+            "stop_price":    str(round(new_stop, 2)),
+            "time_in_force": "gtc",
+        })
+        await log_bot(
+            f"[{symbol}] Trailing stop: ${old_stop:.2f} → ${new_stop:.2f}",
+            "info",
+        )
+        # Update Supabase stop_loss
+        supabase.table("trades").update({"stop_loss": round(new_stop, 2)}).eq("symbol", symbol).eq("status", "open").execute()
+    except Exception as e:
+        await log_bot(f"[{symbol}] Stop replace failed: {e}", "error")
+
+# ---------------------------------------------------------------------------
+# Performance metrics
+# ---------------------------------------------------------------------------
+async def update_performance():
+    """Recalculate win rate and daily metrics from closed trades."""
+    try:
+        today = datetime.now(timezone.utc).date().isoformat()
+        res = (
+            supabase.table("trades")
+            .select("pnl, status")
+            .eq("status", "closed")
+            .execute()
+        )
+        if not res.data:
+            return
+
+        closed = res.data
+        wins   = sum(1 for t in closed if (t.get("pnl") or 0) > 0)
+        total  = len(closed)
+
+        bot_state["win_rate"]     = round(wins / total * 100, 1) if total > 0 else 0.0
+        bot_state["wins_today"]   = wins
+        bot_state["losses_today"] = total - wins
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Portfolio sync
@@ -453,16 +693,18 @@ async def scan_symbol(
             symbol, ind_5m, ind_1h, ind_1d,
             news, regime, portfolio_value, open_positions,
         )
+
         signal["symbol"]     = symbol
         signal["created_at"] = datetime.now(timezone.utc).isoformat()
-        signal["strategy"]   = "ascend_elite"
+        signal["strategy"]   = "ascend_elite_v3"
         signal["strength"]   = signal.get("confidence", 0)
+        signal["_score"]     = composite_score(signal, ind_5m, ind_1h)
 
         supabase.table("signals").insert({
             "symbol":     symbol,
-            "signal":     signal["signal"],
+            "signal":     signal.get("signal", "hold"),
             "strength":   signal["strength"],
-            "strategy":   "ascend_elite",
+            "strategy":   "ascend_elite_v3",
             "indicators": {
                 "5m":    ind_5m,
                 "1h":    ind_1h,
@@ -472,13 +714,17 @@ async def scan_symbol(
             "created_at": signal["created_at"],
         }).execute()
 
-        bot_state["last_signal_at"] = signal["created_at"]
+        bot_state["last_signal_at"]  = signal["created_at"]
         bot_state["signals_today"]  += 1
 
         trend = mtf_trend(ind_5m, ind_1h, ind_1d)
         await log_bot(
-            f"[{symbol}] {signal['signal'].upper()} | conf={signal['confidence']:.0%} "
-            f"| trend={trend} | rsi={ind_1h.get('rsi')} | vol={ind_1h.get('volume_ratio')}x",
+            f"[{symbol}] {signal.get('signal','?').upper()} | "
+            f"conf={signal.get('confidence',0):.0%} | "
+            f"score={signal.get('_score',0):.2f} | "
+            f"trend={trend} | rsi1h={ind_1h.get('rsi')} | "
+            f"vol={ind_1h.get('volume_ratio')}x | "
+            f"criteria={signal.get('criteria_met','?')}/7",
             "info",
         )
         return signal
@@ -494,27 +740,32 @@ async def run_scan():
 
     try:
         n = bot_state["scan_count"] + 1
-        await log_bot(f"▶ Scan #{n} starting — {len(WATCHLIST)} symbols", "info")
+        await log_bot(f"▶ Scan #{n} | {len(WATCHLIST)} symbols", "info")
 
         regime, account = await asyncio.gather(
             get_market_regime(),
             alpaca_get("/v2/account"),
         )
 
+        # Circuit breaker check
+        if await check_circuit_breaker(account):
+            await log_bot("Circuit breaker active — skipping trade execution this scan", "warning")
+
         portfolio_value = float(account.get("portfolio_value", 100_000))
         positions_resp  = await alpaca_get("/v2/positions")
         open_positions  = len(positions_resp) if isinstance(positions_resp, list) else 0
 
         await log_bot(
-            f"Regime: {regime['regime'].upper()} | "
-            f"Portfolio: ${portfolio_value:,.0f} | "
-            f"Positions: {open_positions}/{MAX_POSITIONS}",
+            f"Regime: {regime.get('regime','?').upper()} | "
+            f"${portfolio_value:,.0f} | {open_positions}/{MAX_POSITIONS} positions open",
             "info",
         )
 
-        # Scan in batches to respect rate limits
+        # Scan all symbols in batches
         all_signals: list[dict] = []
         for i in range(0, len(WATCHLIST), BATCH_SIZE):
+            if not bot_state["running"]:
+                return
             batch   = WATCHLIST[i : i + BATCH_SIZE]
             results = await asyncio.gather(*[
                 scan_symbol(sym, regime, portfolio_value, open_positions)
@@ -523,47 +774,72 @@ async def run_scan():
             all_signals.extend(s for s in results if s is not None)
             await asyncio.sleep(1.5)
 
-        # Filter and rank actionable signals
+        # Filter and rank by composite score
         actionable = sorted(
-            [s for s in all_signals if s.get("signal") in ("buy", "sell") and s.get("confidence", 0) >= MIN_CONFIDENCE],
-            key=lambda x: x["confidence"],
+            [
+                s for s in all_signals
+                if s.get("signal") in ("buy", "sell")
+                and s.get("confidence", 0) >= MIN_CONFIDENCE
+                and s.get("risk_reward_ratio", 0) >= MIN_RR
+            ],
+            key=lambda x: x.get("_score", 0),
             reverse=True,
         )
 
         slots = MAX_POSITIONS - open_positions
-        await log_bot(f"Found {len(actionable)} high-confidence signals | {slots} slots available", "info")
+        await log_bot(
+            f"{len(actionable)} high-conviction signals | {slots} slots | "
+            f"circuit_breaker={bot_state['circuit_breaker_active']}",
+            "info",
+        )
 
-        for signal in actionable[:slots]:
-            if not bot_state["running"]:
-                break
-            try:
-                order = await execute_signal(signal, portfolio_value)
-                if order:
-                    await log_bot(
-                        f"✅ TRADE: {signal['signal'].upper()} {signal['symbol']} "
-                        f"| conf={signal['confidence']:.0%} "
-                        f"| entry=${signal['entry_price']} "
-                        f"| stop=${signal['stop_loss']} "
-                        f"| target=${signal['take_profit']}",
-                        "info",
-                    )
-            except Exception as e:
-                await log_bot(f"Order failed [{signal['symbol']}]: {e}", "error")
+        if not bot_state["circuit_breaker_active"]:
+            for signal in actionable[:slots]:
+                if not bot_state["running"]:
+                    break
+                try:
+                    order = await execute_signal(signal, portfolio_value)
+                    if order:
+                        await log_bot(
+                            f"✅ TRADE: {signal['signal'].upper()} {signal['symbol']} | "
+                            f"conf={signal['confidence']:.0%} | "
+                            f"R/R={signal.get('risk_reward_ratio',0):.1f} | "
+                            f"entry=${signal['entry_price']} | "
+                            f"stop=${signal['stop_loss']} | "
+                            f"target=${signal['take_profit']}",
+                            "info",
+                        )
+                except Exception as e:
+                    await log_bot(f"Order failed [{signal['symbol']}]: {e}", "error")
 
         await sync_portfolio(account)
+        await update_performance()
 
-        bot_state["scan_count"]   += 1
-        bot_state["last_scan_at"]  = datetime.now(timezone.utc).isoformat()
-        await log_bot(f"✓ Scan #{n} complete — {len(actionable)} signals acted on", "info")
+        bot_state["scan_count"]  += 1
+        bot_state["last_scan_at"] = datetime.now(timezone.utc).isoformat()
+        await log_bot(f"✓ Scan #{n} complete", "info")
 
     except Exception as e:
-        await log_bot(f"Scan loop error: {e}", "error")
+        await log_bot(f"Scan error: {e}", "error")
 
-
+# ---------------------------------------------------------------------------
+# Background loops
+# ---------------------------------------------------------------------------
 async def scanner_loop():
     while bot_state["running"]:
         await run_scan()
         for _ in range(SCAN_INTERVAL_SECS):
+            if not bot_state["running"]:
+                return
+            await asyncio.sleep(1)
+
+
+async def monitor_loop():
+    """Separate loop: monitors positions and updates trailing stops."""
+    await asyncio.sleep(30)  # brief startup delay
+    while bot_state["running"]:
+        await monitor_positions()
+        for _ in range(MONITOR_INTERVAL):
             if not bot_state["running"]:
                 return
             await asyncio.sleep(1)
@@ -574,13 +850,14 @@ async def scanner_loop():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     bot_state["started_at"] = datetime.now(timezone.utc).isoformat()
-    await log_bot("Ascend Trader Elite v2 initialized", "info")
+    await log_bot("🚀 Ascend Trader Elite v3 initialized", "info")
     yield
-    if scan_task and not scan_task.done():
-        scan_task.cancel()
+    for t in [scan_task, monitor_task]:
+        if t and not t.done():
+            t.cancel()
 
 
-app = FastAPI(title="Ascend Trader Elite", version="2.0.0", lifespan=lifespan)
+app = FastAPI(title="Ascend Trader Elite", version="3.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -600,36 +877,42 @@ async def health():
 async def get_status():
     uptime = 0
     if bot_state["started_at"]:
-        started = datetime.fromisoformat(bot_state["started_at"])
-        uptime  = int((datetime.now(timezone.utc) - started).total_seconds())
+        uptime = int(
+            (datetime.now(timezone.utc) - datetime.fromisoformat(bot_state["started_at"])).total_seconds()
+        )
     return {**bot_state, "uptime_seconds": uptime}
 
 
 @app.post("/start")
 async def start_bot():
-    global scan_task
+    global scan_task, monitor_task
     if bot_state["running"]:
         return {"status": "already_running"}
-    bot_state.update(running=True, trades_today=0, signals_today=0, scan_count=0)
-    scan_task = asyncio.create_task(scanner_loop())
-    await log_bot("🚀 Bot STARTED — Ascend Elite strategy active", "info")
+    bot_state.update(
+        running=True, circuit_breaker_active=False,
+        trades_today=0, signals_today=0, scan_count=0,
+    )
+    scan_task    = asyncio.create_task(scanner_loop())
+    monitor_task = asyncio.create_task(monitor_loop())
+    await log_bot("🟢 Bot STARTED — Ascend Elite v3 active", "info")
     return {"status": "started"}
 
 
 @app.post("/stop")
 async def stop_bot():
-    global scan_task
+    global scan_task, monitor_task
     bot_state["running"] = False
-    if scan_task:
-        scan_task.cancel()
-    await log_bot("⏹ Bot STOPPED", "warning")
+    for t in [scan_task, monitor_task]:
+        if t:
+            t.cancel()
+    await log_bot("🔴 Bot STOPPED", "warning")
     return {"status": "stopped"}
 
 
 @app.post("/scan")
 async def trigger_scan():
     if not bot_state["running"]:
-        raise HTTPException(400, "Bot is not running. Call /start first.")
+        raise HTTPException(400, "Bot not running. Call /start first.")
     asyncio.create_task(run_scan())
     return {"status": "scan_triggered"}
 
@@ -644,12 +927,21 @@ async def get_positions():
     return await alpaca_get("/v2/positions")
 
 
+@app.get("/performance")
+async def get_performance():
+    await update_performance()
+    return {
+        "win_rate":    bot_state["win_rate"],
+        "trades_today": bot_state["trades_today"],
+        "signals_today": bot_state["signals_today"],
+        "day_pnl_pct":  bot_state["day_pnl"],
+        "scan_count":   bot_state["scan_count"],
+    }
+
+
 @app.delete("/order/{order_id}")
 async def cancel_order(order_id: str):
-    async with httpx.AsyncClient() as client:
-        r = await client.delete(
-            f"{ALPACA_TRADE_URL}/v2/orders/{order_id}", headers=ALPACA_HEADERS
-        )
-        if r.status_code not in (200, 204):
-            raise HTTPException(r.status_code, r.text)
+    success = await alpaca_delete(f"/v2/orders/{order_id}")
+    if not success:
+        raise HTTPException(400, "Cancel failed")
     return {"cancelled": order_id}
