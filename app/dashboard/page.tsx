@@ -10,16 +10,24 @@ import {
   BrainCircuit,
   CalendarClock,
   CandlestickChart,
+  CheckCircle2,
   Clock,
   DollarSign,
+  FileSearch,
+  Flame,
   Gauge,
   Layers,
+  ListChecks,
+  MessageSquareText,
   Radio,
+  Route,
+  ScanLine,
   ShieldCheck,
   Sparkles,
   Target,
   TrendingUp,
   Wallet,
+  XCircle,
   Zap,
 } from "lucide-react";
 import { StatCard } from "@/components/ui/StatCard";
@@ -31,12 +39,21 @@ import { TradingViewChart } from "@/components/charts/TradingViewChart";
 import { BotCommandCenter } from "@/components/bot/BotCommandCenter";
 import { usePortfolio } from "@/hooks/usePortfolio";
 import { useTrades } from "@/hooks/useTrades";
-import { useRealtimeSignals, useRealtimeTrades } from "@/hooks/useRealtime";
+import { useRealtime, useRealtimeSignals, useRealtimeTrades } from "@/hooks/useRealtime";
 import { createClient } from "@/lib/supabase/client";
 import { formatCurrency, pnlColor, cn } from "@/lib/utils";
-import type { Signal } from "@/types";
+import type { BotLog, Signal } from "@/types";
 
 const WATCHLIST = ["SPY", "NVDA", "AAPL", "TSLA", "MSFT", "AMZN"];
+
+const INTELLIGENCE_LAYERS = [
+  { label: "Market Regime", detail: "SPY + QQQ context", icon: Route, tone: "text-cyan" },
+  { label: "Technicals", detail: "5m / 1h / daily stack", icon: CandlestickChart, tone: "text-success" },
+  { label: "Claude Scoring", detail: "7-criteria decision", icon: BrainCircuit, tone: "text-purple" },
+  { label: "Risk Engine", detail: "Heat + correlation gates", icon: ShieldCheck, tone: "text-primary" },
+  { label: "Earnings", detail: "Priority catalyst scan", icon: CalendarClock, tone: "text-amber-300" },
+  { label: "13F Smart Money", detail: "Lagged fund positioning", icon: FileSearch, tone: "text-cyan" },
+];
 
 const QUICK_LINKS = [
   { href: "/analytics", label: "Analytics", icon: BarChart3 },
@@ -69,11 +86,25 @@ function formatClock() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function logTone(level: BotLog["level"]) {
+  if (level === "error") return "text-danger";
+  if (level === "warning") return "text-amber-300";
+  return "text-cyan";
+}
+
+function logIcon(level: BotLog["level"]) {
+  if (level === "error") return XCircle;
+  if (level === "warning") return ShieldCheck;
+  return CheckCircle2;
+}
+
 export default function DashboardPage() {
   const { portfolio, snapshots, loading: portfolioLoading } = usePortfolio();
   const { trades, loading: tradesLoading, refetch: refetchTrades } = useTrades({ status: "open", limit: 8 });
   const [signals, setSignals] = useState<Signal[]>([]);
+  const [botLogs, setBotLogs] = useState<BotLog[]>([]);
   const [sigLoading, setSigLoading] = useState(true);
+  const [logsLoading, setLogsLoading] = useState(true);
   const [marketSymbol, setMarketSymbol] = useState(WATCHLIST[0]);
   const [clock, setClock] = useState("--:--");
 
@@ -86,7 +117,7 @@ export default function DashboardPage() {
   }, []);
 
   useEffect(() => {
-    supabase
+    void supabase
       .from("signals")
       .select("*")
       .order("created_at", { ascending: false })
@@ -97,13 +128,29 @@ export default function DashboardPage() {
       });
   }, []);
 
+  useEffect(() => {
+    void supabase
+      .from("bot_logs")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(8)
+      .then(({ data }) => {
+        setBotLogs((data as BotLog[]) ?? []);
+        setLogsLoading(false);
+      });
+  }, []);
+
   const handleNewTrade = useCallback(() => refetchTrades(), [refetchTrades]);
   const handleNewSignal = useCallback((payload: Record<string, unknown>) => {
     setSignals((prev) => [payload.new as Signal, ...prev].slice(0, 6));
   }, []);
+  const handleNewLog = useCallback((payload: Record<string, unknown>) => {
+    setBotLogs((prev) => [payload.new as BotLog, ...prev].slice(0, 8));
+  }, []);
 
   useRealtimeTrades(handleNewTrade);
   useRealtimeSignals(handleNewSignal);
+  useRealtime({ table: "bot_logs", event: "INSERT", onData: handleNewLog });
 
   const equity = portfolio?.equity ?? 0;
   const cash = portfolio?.cash ?? 0;
@@ -192,6 +239,12 @@ export default function DashboardPage() {
     },
   ];
 
+  const rejectedSignals = signals.filter((signal) => signal.signal === "hold").length;
+  const topWatchlist = WATCHLIST.map((symbol) => ({
+    symbol,
+    signal: signals.find((item) => item.symbol === symbol),
+  }));
+
   return (
     <div className="flex h-full flex-col overflow-y-auto">
       <div className="border-b border-white/[0.06] px-6 py-5">
@@ -260,6 +313,123 @@ export default function DashboardPage() {
         </div>
 
         <BotCommandCenter />
+
+        <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
+          <section className="glass overflow-hidden rounded-2xl xl:col-span-7">
+            <div className="flex flex-col gap-3 border-b border-white/[0.06] px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <div className="mb-1 flex items-center gap-2">
+                  <ScanLine className="h-4 w-4 text-cyan" />
+                  <h2 className="font-space text-sm font-semibold text-primary">Bot Activity Tape</h2>
+                </div>
+                <p className="text-xs text-muted">Live scan decisions, risk blocks, orders, and outcome grading</p>
+              </div>
+              <div className="flex items-center gap-2 rounded-lg border border-white/[0.08] bg-base/50 px-3 py-2">
+                <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse-slow" />
+                <span className="font-space text-[10px] font-semibold uppercase tracking-widest text-muted">
+                  Streaming
+                </span>
+              </div>
+            </div>
+
+            <div className="max-h-[354px] overflow-y-auto">
+              {logsLoading ? (
+                <div className="space-y-3 p-5">
+                  {Array.from({ length: 5 }).map((_, index) => (
+                    <div key={index} className="flex gap-3">
+                      <div className="shimmer h-8 w-8 rounded-lg" />
+                      <div className="flex-1 space-y-2">
+                        <div className="shimmer h-3 w-2/3 rounded" />
+                        <div className="shimmer h-3 w-1/3 rounded" />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : botLogs.length === 0 ? (
+                <EmptyState
+                  icon={MessageSquareText}
+                  title="No bot activity yet"
+                  detail="Once Railway is connected and the scanner runs, every decision will stream here."
+                />
+              ) : (
+                <div className="divide-y divide-white/[0.04]">
+                  {botLogs.map((log, index) => {
+                    const Icon = logIcon(log.level);
+                    return (
+                      <motion.div
+                        key={log.id}
+                        initial={{ opacity: 0, y: 8 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: index * 0.03 }}
+                        className="grid grid-cols-[36px_1fr_74px] gap-3 px-5 py-3.5 transition-colors hover:bg-white/[0.02]"
+                      >
+                        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/[0.06] bg-white/[0.03]">
+                          <Icon className={cn("h-4 w-4", logTone(log.level))} />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="line-clamp-2 text-sm text-primary">{log.message}</p>
+                          <p className="mt-1 font-space text-[10px] uppercase tracking-widest text-muted">
+                            {log.level}
+                          </p>
+                        </div>
+                        <span className="pt-1 text-right text-[10px] text-muted">
+                          {formatRelativeTime(log.created_at)}
+                        </span>
+                      </motion.div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </section>
+
+          <section className="glass rounded-2xl p-5 xl:col-span-5">
+            <div className="mb-5 flex items-center justify-between">
+              <div>
+                <div className="mb-1 flex items-center gap-2">
+                  <BrainCircuit className="h-4 w-4 text-purple" />
+                  <h2 className="font-space text-sm font-semibold text-primary">Intelligence Stack</h2>
+                </div>
+                <p className="text-xs text-muted">The signal inputs feeding every Claude decision</p>
+              </div>
+              <span className="rounded-lg border border-purple/20 bg-purple/10 px-2.5 py-1 font-space text-[10px] font-bold text-purple">
+                6 layers
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+              {INTELLIGENCE_LAYERS.map((layer) => (
+                <div
+                  key={layer.label}
+                  className="flex min-h-[72px] items-center gap-3 rounded-xl border border-white/[0.06] bg-white/[0.025] p-3"
+                >
+                  <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-white/[0.06] bg-base/60">
+                    <layer.icon className={cn("h-4 w-4", layer.tone)} />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="truncate font-space text-xs font-bold text-primary">{layer.label}</p>
+                    <p className="mt-1 truncate text-[11px] text-muted">{layer.detail}</p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-5 rounded-xl border border-white/[0.06] bg-base/50 p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <ListChecks className="h-4 w-4 text-success" />
+                  <p className="font-space text-xs font-bold text-primary">Decision Quality</p>
+                </div>
+                <span className="font-space text-[10px] text-muted">{signals.length} recent signals</span>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <SignalMetric label="Passed" value={String(signalStats.actionable)} />
+                <SignalMetric label="Rejected" value={String(rejectedSignals)} />
+                <SignalMetric label="Avg Conf" value={formatConfidence(signalStats.avgConfidence)} />
+              </div>
+            </div>
+          </section>
+        </div>
 
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <StatCard
@@ -370,6 +540,73 @@ export default function DashboardPage() {
             </div>
           </section>
         </div>
+
+        <section className="glass rounded-2xl p-5">
+          <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <div>
+              <div className="mb-1 flex items-center gap-2">
+                <Flame className="h-4 w-4 text-success" />
+                <h2 className="font-space text-sm font-semibold text-primary">Watchlist Intelligence Matrix</h2>
+              </div>
+              <p className="text-xs text-muted">Fast read on what the bot has recently seen across priority symbols</p>
+            </div>
+            <Link
+              href="/signals"
+              className="flex h-9 w-fit items-center gap-2 rounded-lg border border-white/[0.08] bg-surface px-3 text-xs font-semibold text-muted transition-colors hover:border-cyan/30 hover:text-primary"
+            >
+              Full signal grid
+              <ArrowUpRight className="h-3 w-3" />
+            </Link>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+            {topWatchlist.map(({ symbol, signal }) => {
+              const confidence = signal?.confidence ?? signal?.strength ?? null;
+              const active = marketSymbol === symbol;
+              return (
+                <button
+                  key={symbol}
+                  onClick={() => setMarketSymbol(symbol)}
+                  className={cn(
+                    "group rounded-xl border p-3 text-left transition-colors",
+                    active
+                      ? "border-cyan/30 bg-cyan/[0.06]"
+                      : "border-white/[0.06] bg-white/[0.025] hover:border-white/[0.12] hover:bg-white/[0.04]"
+                  )}
+                >
+                  <div className="mb-3 flex items-start justify-between">
+                    <div>
+                      <p className="font-space text-sm font-bold text-primary">{symbol}</p>
+                      <p className="mt-0.5 text-[10px] uppercase tracking-widest text-muted">
+                        {signal ? formatRelativeTime(signal.created_at) : "No scan"}
+                      </p>
+                    </div>
+                    {signal ? (
+                      <TradeBadge signal={signal.signal.toUpperCase() as "BUY" | "SELL" | "HOLD"} />
+                    ) : (
+                      <span className="rounded-md border border-white/[0.06] px-1.5 py-0.5 text-[9px] font-semibold text-muted">
+                        WAIT
+                      </span>
+                    )}
+                  </div>
+                  <div className="mb-2 flex items-center justify-between text-[10px] text-muted">
+                    <span>Conviction</span>
+                    <span className="font-space text-primary">{formatConfidence(confidence)}</span>
+                  </div>
+                  <div className="h-1.5 overflow-hidden rounded-full bg-white/[0.06]">
+                    <div
+                      className={cn(
+                        "h-full rounded-full",
+                        signal?.signal === "sell" ? "bg-danger" : signal?.signal === "buy" ? "bg-cyan" : "bg-muted"
+                      )}
+                      style={{ width: `${confidence != null ? clampPct(confidence * 100) : 8}%` }}
+                    />
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </section>
 
         <section className="glass rounded-2xl p-5">
           <div className="mb-4 flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
