@@ -24,6 +24,14 @@ from backtest import fetch_historical_bars, parse_config, run_research_backtest
 from risk_engine import validate_trade, kelly_fraction
 from earnings import get_pre_earnings_opportunities
 from institutional import get_cached_intel, build_institutional_context, institutional_signal_boost
+from no_trade_calendar import get_calendar_context, should_trade_now
+from regime_brain import get_full_regime, trading_rules_for_regime
+from setup_classifier import classify_setup, score_setup_quality, setup_notes_for_claude
+from signal_memory import (
+    build_memory_from_outcomes,
+    build_memory_prompt_section,
+    get_setup_historical_accuracy,
+)
 
 load_dotenv()
 
@@ -113,6 +121,10 @@ bot_state = {
     "started_at":              None,
     "scan_count":              0,
     "options_mode":            False,
+    "no_trade_active":         False,
+    "no_trade_reason":         None,
+    "advanced_regime":         "unknown",
+    "regime_confidence":       0.0,
 }
 
 scan_task:    Optional[asyncio.Task] = None
@@ -430,9 +442,10 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
 # ---------------------------------------------------------------------------
 async def get_market_regime() -> dict:
     try:
-        spy_bars, qqq_bars = await asyncio.gather(
+        spy_bars, qqq_bars, advanced = await asyncio.gather(
             fetch_bars("SPY", "1Hour", 50),
             fetch_bars("QQQ", "1Hour", 50),
+            get_full_regime(ALPACA_HEADERS, ALPACA_DATA_URL),
         )
         spy = compute_indicators(spy_bars)
         qqq = compute_indicators(qqq_bars)
@@ -447,8 +460,16 @@ async def get_market_regime() -> dict:
         if spy.get("ema_trend") == "bearish" and qqq.get("ema_trend") == "bearish":
             regime = "bear"
 
+        bot_state["advanced_regime"] = advanced.get("regime", "unknown")
+        bot_state["regime_confidence"] = advanced.get("confidence", 0.0)
+
         return {
             "regime":        regime,
+            "advanced_regime": advanced.get("regime", "unknown"),
+            "regime_confidence": advanced.get("confidence", 0.0),
+            "leading_sector": advanced.get("leading_sector"),
+            "regime_note": advanced.get("regime_note"),
+            "regime_rules": trading_rules_for_regime(advanced.get("regime", "unknown")),
             "spy_rsi":       spy.get("rsi"),
             "spy_trend":     spy.get("ema_trend"),
             "spy_price":     spy.get("price"),
@@ -457,8 +478,14 @@ async def get_market_regime() -> dict:
             "qqq_trend":     qqq.get("ema_trend"),
             "qqq_rsi":       qqq.get("rsi"),
         }
-    except Exception:
-        return {"regime": "unknown"}
+    except Exception as exc:
+        return {
+            "regime": "unknown",
+            "advanced_regime": "unknown",
+            "regime_confidence": 0.0,
+            "regime_note": f"Regime detection failed: {exc}",
+            "regime_rules": trading_rules_for_regime("unknown"),
+        }
 
 # ---------------------------------------------------------------------------
 # Claude AI analysis
@@ -473,6 +500,11 @@ async def analyze_with_claude(
     portfolio_value: float,
     open_positions: int,
     intel: dict | None = None,
+    memory_context: str = "",
+    setup_type: str = "unknown",
+    setup_quality: float = 0.0,
+    setup_confidence: float = 0.0,
+    calendar_context: str = "",
 ) -> dict:
     if claude is None:
         return {
@@ -490,6 +522,8 @@ async def analyze_with_claude(
     ) or "No recent news."
 
     institutional_text = build_institutional_context(intel or {}, symbol)
+    setup_text = setup_notes_for_claude(setup_type)
+    calendar_text = calendar_context or get_calendar_context()
 
     prompt = f"""You are the head trader at an elite quantitative hedge fund. You manage a high-conviction momentum portfolio. Your mandate: find asymmetric opportunities with exceptional risk/reward. You do not trade mediocre setups.
 
@@ -500,6 +534,18 @@ QQQ: trend={market_regime.get('qqq_trend')} | RSI={market_regime.get('qqq_rsi')}
 
 ## SMART MONEY POSITIONING
 {institutional_text}
+
+## MACRO / SESSION RISK CALENDAR
+{calendar_text}
+
+## SETUP CLASSIFICATION
+Setup type: {setup_type}
+Classifier confidence: {setup_confidence:.2f}/1.0
+Setup quality in current regime: {setup_quality:.2f}/1.0
+{setup_text}
+
+## SIGNAL MEMORY
+{memory_context or "SIGNAL MEMORY: No historical memory context available."}
 
 ## TARGET: {symbol}
 Multi-Timeframe Alignment: {trend.upper()}
@@ -530,6 +576,9 @@ Value: ${portfolio_value:,.0f} | Open: {open_positions}/{MAX_POSITIONS} | Risk/t
 
 ## RULES
 - Need 5+ of 7 criteria to trade. Quality > quantity.
+- If the calendar/session risk says do not trade, return HOLD unless the prompt explicitly says monitoring only.
+- If setup quality is below 0.45, return HOLD unless every other factor is exceptional.
+- If signal memory says this symbol/setup is historically over-confident, lower confidence.
 - Minimum R/R: {MIN_RR}:1 (stop loss must be tight, target must be realistic)
 - Stop loss: use ATR-based (1.0-1.5x ATR from entry)
 - Take profit: minimum {MIN_RR}x the stop distance
@@ -625,7 +674,8 @@ async def check_circuit_breaker(account: dict) -> bool:
 async def execute_signal(signal: dict, portfolio_value: float, open_positions_list: Optional[list] = None) -> Optional[dict]:
     if signal.get("signal") == "hold":
         return None
-    if signal.get("confidence", 0) < MIN_CONFIDENCE:
+    min_confidence = float(signal.get("min_confidence_required", MIN_CONFIDENCE))
+    if signal.get("confidence", 0) < min_confidence:
         return None
     if signal.get("risk_reward_ratio", 0) < MIN_RR:
         return None
@@ -905,6 +955,9 @@ async def scan_symbol(
     portfolio_value: float,
     open_positions: int,
     intel: dict | None = None,
+    memory: dict | None = None,
+    earnings_catalyst: bool = False,
+    calendar_context: str = "",
 ) -> Optional[dict]:
     try:
         bars_5m, bars_1h, bars_1d = await asyncio.gather(
@@ -923,11 +976,47 @@ async def scan_symbol(
         if not ind_5m or "error" in ind_5m:
             return None
 
-        news   = await fetch_news(symbol)
+        news = await fetch_news(symbol)
+        setup_type, setup_confidence = classify_setup(
+            ind_5m,
+            ind_1h,
+            ind_1d,
+            news,
+            earnings_catalyst=earnings_catalyst,
+        )
+        advanced_regime = regime.get("advanced_regime") or regime.get("regime", "unknown")
+        setup_quality = score_setup_quality(setup_type, ind_1h, advanced_regime)
+        memory_context = build_memory_prompt_section(memory or {}, symbol)
+
         signal = await analyze_with_claude(
             symbol, ind_5m, ind_1h, ind_1d,
             news, regime, portfolio_value, open_positions,
             intel=intel,
+            memory_context=memory_context,
+            setup_type=setup_type,
+            setup_quality=setup_quality,
+            setup_confidence=setup_confidence,
+            calendar_context=calendar_context,
+        )
+
+        raw_confidence = float(signal.get("confidence", 0) or 0)
+        try:
+            memory_accuracy = await get_setup_historical_accuracy(
+                require_supabase(),
+                symbol=symbol,
+                regime=advanced_regime,
+                setup_type=setup_type,
+                confidence=raw_confidence,
+            )
+            signal["confidence"] = memory_accuracy.get("calibrated_confidence", raw_confidence)
+            signal["memory_adjustment"] = memory_accuracy
+        except Exception:
+            signal["memory_adjustment"] = {"memory_note": "Memory calibration unavailable."}
+
+        regime_rules = regime.get("regime_rules") or trading_rules_for_regime(advanced_regime)
+        min_confidence_required = max(
+            MIN_CONFIDENCE,
+            float(regime_rules.get("confidence_threshold", MIN_CONFIDENCE)),
         )
 
         signal["symbol"]     = symbol
@@ -935,6 +1024,10 @@ async def scan_symbol(
         signal["strategy"]   = "ascend_elite_v3"
         signal["strength"]   = signal.get("confidence", 0)
         signal["_score"]     = composite_score(signal, ind_5m, ind_1h, intel)
+        signal["setup_type"] = setup_type
+        signal["setup_quality"] = setup_quality
+        signal["setup_confidence"] = setup_confidence
+        signal["min_confidence_required"] = min_confidence_required
 
         db = require_supabase()
         signal_insert = db.table("signals").insert({
@@ -956,8 +1049,16 @@ async def scan_symbol(
                 "1h":    ind_1h,
                 "1d":    ind_1d,
                 "trend": mtf_trend(ind_5m, ind_1h, ind_1d),
+                "setup": {
+                    "type": setup_type,
+                    "classification_confidence": setup_confidence,
+                    "quality": setup_quality,
+                    "min_confidence_required": min_confidence_required,
+                    "memory_adjustment": signal.get("memory_adjustment"),
+                },
             },
             "created_at": signal["created_at"],
+            "earnings_catalyst": earnings_catalyst,
         }).execute()
         if signal_insert.data:
             signal["signal_id"] = signal_insert.data[0].get("id")
@@ -970,6 +1071,7 @@ async def scan_symbol(
             f"[{symbol}] {signal.get('signal','?').upper()} | "
             f"conf={signal.get('confidence',0):.0%} | "
             f"score={signal.get('_score',0):.2f} | "
+            f"setup={setup_type} q={setup_quality:.2f} | "
             f"trend={trend} | rsi1h={ind_1h.get('rsi')} | "
             f"vol={ind_1h.get('volume_ratio')}x | "
             f"criteria={signal.get('criteria_met','?')}/7",
@@ -990,9 +1092,20 @@ async def run_scan():
         n = bot_state["scan_count"] + 1
         await log_bot(f"▶ Scan #{n} | {len(WATCHLIST)} symbols", "info")
 
+        trade_allowed, no_trade_reason = should_trade_now()
+        calendar_context = get_calendar_context()
+        bot_state["no_trade_active"] = not trade_allowed
+        bot_state["no_trade_reason"] = no_trade_reason or None
+
+        if not trade_allowed:
+            await log_bot(f"No-trade gate active: {no_trade_reason}", "warning")
+
         regime, account = await asyncio.gather(
             get_market_regime(),
             alpaca_get("/v2/account"),
+        )
+        regime_rules = regime.get("regime_rules") or trading_rules_for_regime(
+            regime.get("advanced_regime", "unknown")
         )
 
         # Circuit breaker check
@@ -1006,6 +1119,8 @@ async def run_scan():
 
         await log_bot(
             f"Regime: {regime.get('regime','?').upper()} | "
+            f"advanced={regime.get('advanced_regime','unknown')} "
+            f"({float(regime.get('regime_confidence', 0) or 0):.0%}) | "
             f"${portfolio_value:,.0f} | {open_positions}/{MAX_POSITIONS} positions open",
             "info",
         )
@@ -1049,6 +1164,13 @@ async def run_scan():
         except Exception as e:
             await log_bot(f"Institutional intel error: {e}", "warning")
 
+        # Fetch signal memory once per scan so Claude gets empirical feedback.
+        memory: dict = {}
+        try:
+            memory = await build_memory_from_outcomes(require_supabase())
+        except Exception as e:
+            await log_bot(f"Signal memory unavailable: {e}", "warning")
+
         # Scan all symbols in batches
         all_signals: list[dict] = []
         for i in range(0, len(ordered_watchlist), BATCH_SIZE):
@@ -1056,7 +1178,16 @@ async def run_scan():
                 return
             batch   = ordered_watchlist[i : i + BATCH_SIZE]
             results = await asyncio.gather(*[
-                scan_symbol(sym, regime, portfolio_value, open_positions, intel=intel)
+                scan_symbol(
+                    sym,
+                    regime,
+                    portfolio_value,
+                    open_positions,
+                    intel=intel,
+                    memory=memory,
+                    earnings_catalyst=sym in earnings_symbols,
+                    calendar_context=calendar_context,
+                )
                 for sym in batch
             ])
             for s in results:
@@ -1076,22 +1207,24 @@ async def run_scan():
             [
                 s for s in all_signals
                 if s.get("signal") in ("buy", "sell")
-                and s.get("confidence", 0) >= MIN_CONFIDENCE
+                and s.get("confidence", 0) >= s.get("min_confidence_required", MIN_CONFIDENCE)
                 and s.get("risk_reward_ratio", 0) >= MIN_RR
             ],
             key=_sort_key,
             reverse=True,
         )
 
-        slots = MAX_POSITIONS - open_positions
+        max_positions_allowed = min(MAX_POSITIONS, int(regime_rules.get("max_positions", MAX_POSITIONS)))
+        slots = max(0, max_positions_allowed - open_positions)
         await log_bot(
             f"{len(actionable)} high-conviction signals | {slots} slots | "
             f"circuit_breaker={bot_state['circuit_breaker_active']} | "
+            f"no_trade={not trade_allowed} | "
             f"earnings_catalysts={len(earnings_symbols)}",
             "info",
         )
 
-        if not bot_state["circuit_breaker_active"]:
+        if trade_allowed and not bot_state["circuit_breaker_active"]:
             for signal in actionable[:slots]:
                 if not bot_state["running"]:
                     break
@@ -1112,6 +1245,12 @@ async def run_scan():
                         )
                 except Exception as e:
                     await log_bot(f"Order failed [{signal['symbol']}]: {e}", "error")
+        elif actionable:
+            await log_bot(
+                f"Execution skipped for {len(actionable)} signal(s): "
+                f"{no_trade_reason or 'circuit breaker active'}",
+                "warning",
+            )
 
         await sync_portfolio(account)
         await update_performance()
