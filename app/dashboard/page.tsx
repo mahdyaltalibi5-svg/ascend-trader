@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { useState, useCallback, useEffect, useMemo } from "react";
+import type { ReactNode } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Activity,
@@ -20,6 +21,7 @@ import {
   Layers,
   ListChecks,
   MessageSquareText,
+  Eye,
   Radio,
   Route,
   ScanLine,
@@ -28,6 +30,7 @@ import {
   Target,
   TrendingUp,
   Wallet,
+  X,
   XCircle,
   Zap,
 } from "lucide-react";
@@ -131,12 +134,44 @@ function eventSubtitle(event: ScanEvent) {
   return reasoning || catalyst || `${event.stage} stage recorded`;
 }
 
+function asRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+}
+
+function payloadRecord(event: ScanEvent | null) {
+  return asRecord(event?.payload);
+}
+
+function nestedRecord(source: Record<string, unknown>, key: string) {
+  return asRecord(source[key]);
+}
+
+function payloadText(source: Record<string, unknown>, key: string) {
+  const value = source[key];
+  return typeof value === "string" && value.trim() ? value : null;
+}
+
+function payloadNumber(source: Record<string, unknown>, key: string) {
+  const value = source[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function formatDetailValue(value: unknown) {
+  if (value == null || value === "") return "--";
+  if (typeof value === "number") return Math.abs(value) < 1 ? value.toFixed(2) : value.toFixed(1);
+  if (typeof value === "boolean") return value ? "Yes" : "No";
+  if (Array.isArray(value)) return value.length > 0 ? value.join(", ") : "--";
+  if (typeof value === "object") return JSON.stringify(value).slice(0, 90);
+  return String(value);
+}
+
 export default function DashboardPage() {
   const { portfolio, snapshots, loading: portfolioLoading } = usePortfolio();
   const { trades, loading: tradesLoading, refetch: refetchTrades } = useTrades({ status: "open", limit: 8 });
   const [signals, setSignals] = useState<Signal[]>([]);
   const [scanEvents, setScanEvents] = useState<ScanEvent[]>([]);
   const [selectedEvent, setSelectedEvent] = useState<ScanEvent | null>(null);
+  const [drawerOpen, setDrawerOpen] = useState(false);
   const [scanEventsAvailable, setScanEventsAvailable] = useState(true);
   const [botLogs, setBotLogs] = useState<BotLog[]>([]);
   const [sigLoading, setSigLoading] = useState(true);
@@ -428,7 +463,10 @@ export default function DashboardPage() {
                     return (
                       <button
                         key={event.id}
-                        onClick={() => setSelectedEvent(event)}
+                        onClick={() => {
+                          setSelectedEvent(event);
+                          setDrawerOpen(true);
+                        }}
                         className={cn(
                           "grid w-full grid-cols-[36px_1fr_86px] gap-3 px-5 py-3.5 text-left transition-colors hover:bg-white/[0.02]",
                           active && "bg-cyan/[0.04]"
@@ -451,9 +489,15 @@ export default function DashboardPage() {
                             <TinyPill label="Cat" value={event.catalyst_score != null ? `${event.catalyst_score.toFixed(1)}` : "--"} />
                           </div>
                         </div>
-                        <span className="pt-1 text-right text-[10px] text-muted">
-                          {formatRelativeTime(event.created_at)}
-                        </span>
+                        <div className="flex flex-col items-end gap-2 pt-1 text-right">
+                          <span className="text-[10px] text-muted">
+                            {formatRelativeTime(event.created_at)}
+                          </span>
+                          <span className="inline-flex items-center gap-1 rounded-md border border-cyan/15 bg-cyan/[0.05] px-1.5 py-1 font-space text-[9px] font-bold uppercase tracking-widest text-cyan">
+                            <Eye className="h-3 w-3" />
+                            Trace
+                          </span>
+                        </div>
                       </button>
                     );
                   })}
@@ -566,6 +610,13 @@ export default function DashboardPage() {
                 <p className="mt-3 line-clamp-4 text-xs leading-relaxed text-muted">
                   {eventSubtitle(selectedEvent)}
                 </p>
+                <button
+                  onClick={() => setDrawerOpen(true)}
+                  className="mt-3 flex h-9 w-full items-center justify-center gap-2 rounded-lg border border-cyan/20 bg-cyan/[0.06] font-space text-[10px] font-bold uppercase tracking-widest text-cyan transition-colors hover:bg-cyan/[0.1]"
+                >
+                  <Eye className="h-3.5 w-3.5" />
+                  Open Full Trace
+                </button>
               </div>
             )}
           </section>
@@ -901,6 +952,190 @@ export default function DashboardPage() {
           </section>
         </div>
       </div>
+      <ScanEventDrawer
+        event={selectedEvent}
+        open={drawerOpen && Boolean(selectedEvent)}
+        onClose={() => setDrawerOpen(false)}
+      />
+    </div>
+  );
+}
+
+function ScanEventDrawer({
+  event,
+  open,
+  onClose,
+}: {
+  event: ScanEvent | null;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const payload = payloadRecord(event);
+  const catalyst = nestedRecord(payload, "catalyst");
+  const relativeStrength = nestedRecord(payload, "relative_strength");
+  const memory = nestedRecord(payload, "memory_adjustment");
+  const optionsFlow = nestedRecord(payload, "options_flow");
+  const insiderFlow = nestedRecord(payload, "insider_flow");
+  const shortInterest = nestedRecord(payload, "short_interest");
+  const riskOfficer = nestedRecord(payload, "risk_officer");
+  const setup = nestedRecord(payload, "setup");
+  const regime = nestedRecord(payload, "regime");
+
+  return (
+    <AnimatePresence>
+      {open && event && (
+        <>
+          <motion.button
+            aria-label="Close scan detail"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            onClick={onClose}
+            className="fixed inset-0 z-40 bg-black/55 backdrop-blur-sm"
+          />
+          <motion.aside
+            initial={{ x: "100%" }}
+            animate={{ x: 0 }}
+            exit={{ x: "100%" }}
+            transition={{ type: "spring", damping: 28, stiffness: 260 }}
+            className="fixed right-0 top-0 z-50 flex h-dvh w-full max-w-[560px] flex-col border-l border-white/[0.08] bg-base shadow-2xl shadow-black/40"
+          >
+            <div className="border-b border-white/[0.06] px-5 py-4">
+              <div className="flex items-start justify-between gap-4">
+                <div className="min-w-0">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <span className={cn("h-2 w-2 rounded-full", event.stage === "accepted" || event.stage === "ordered" ? "bg-success" : event.stage === "rejected" ? "bg-amber-300" : "bg-cyan")} />
+                    <span className="font-space text-[10px] font-bold uppercase tracking-[0.24em] text-muted">
+                      Signal Trace
+                    </span>
+                  </div>
+                  <h3 className="font-space text-xl font-bold text-primary">
+                    {event.symbol} {event.action?.toUpperCase() ?? event.stage.toUpperCase()}
+                  </h3>
+                  <p className="mt-1 truncate text-xs text-muted">{event.scan_id}</p>
+                </div>
+                <button
+                  onClick={onClose}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-white/[0.08] bg-white/[0.03] text-muted transition-colors hover:text-primary"
+                  aria-label="Close"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 space-y-4 overflow-y-auto p-5">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <SignalMetric label="Stage" value={event.stage} />
+                <SignalMetric label="Confidence" value={formatConfidence(event.confidence)} />
+                <SignalMetric label="Score" value={formatDetailValue(event.composite_score ?? payloadNumber(payload, "composite_score"))} />
+                <SignalMetric label="R/R" value={formatDetailValue(payloadNumber(payload, "risk_reward_ratio"))} />
+              </div>
+
+              <NarrativeBlock title="Claude Reasoning" text={payloadText(payload, "reasoning") ?? eventSubtitle(event)} />
+              <NarrativeBlock title="Catalyst Note" text={payloadText(payload, "catalyst_note")} />
+              <NarrativeBlock title="Risk Officer" text={payloadText(riskOfficer, "note") ?? event.rejection_reason} tone={event.risk_status === "rejected" || event.action === "veto" ? "bad" : "neutral"} />
+              <NarrativeBlock title="Memory Note" text={payloadText(payload, "memory_note")} />
+
+              <DetailGroup title="Trade Plan">
+                <DetailMetric label="Action" value={event.action} />
+                <DetailMetric label="Entry" value={payload.entry_price} />
+                <DetailMetric label="Stop" value={payload.stop_loss} />
+                <DetailMetric label="Target" value={payload.take_profit} />
+                <DetailMetric label="Rules" value={payload.criteria_met != null ? `${payload.criteria_met}/7` : null} />
+                <DetailMetric label="Risk Status" value={event.risk_status} />
+              </DetailGroup>
+
+              <DetailGroup title="Setup Quality">
+                <DetailMetric label="Type" value={event.setup_type ?? setup.type} />
+                <DetailMetric label="Quality" value={event.setup_quality ?? setup.quality} />
+                <DetailMetric label="Classifier" value={setup.classification_confidence} />
+                <DetailMetric label="Min Conf" value={setup.min_confidence_required} />
+              </DetailGroup>
+
+              <DetailGroup title="Catalyst Stack">
+                <DetailMetric label="Score" value={event.catalyst_score ?? catalyst.total_score} />
+                <DetailMetric label="Dominant" value={catalyst.dominant} />
+                <DetailMetric label="Fired" value={catalyst.fired} wide />
+                <PayloadMiniTable data={nestedRecord(catalyst, "components")} />
+              </DetailGroup>
+
+              <DetailGroup title="Market Intelligence">
+                <DetailMetric label="RS Signal" value={event.rs_signal ?? relativeStrength.rs_signal} />
+                <DetailMetric label="RS Rank" value={relativeStrength.rs_rank ?? relativeStrength.rank} />
+                <DetailMetric label="Options" value={optionsFlow.flow_signal ?? optionsFlow.signal} />
+                <DetailMetric label="Options Conv" value={optionsFlow.conviction_score} />
+                <DetailMetric label="Insiders" value={insiderFlow.signal ?? insiderFlow.flow_signal} />
+                <DetailMetric label="Insider Conv" value={insiderFlow.conviction_score} />
+                <DetailMetric label="Short Signal" value={shortInterest.signal ?? shortInterest.squeeze_signal} />
+                <DetailMetric label="Squeeze" value={shortInterest.squeeze_score} />
+              </DetailGroup>
+
+              <DetailGroup title="Confidence Deltas">
+                <DetailMetric label="RS Boost" value={payload.rs_boost} />
+                <DetailMetric label="Insider Boost" value={payload.insider_boost} />
+                <DetailMetric label="Options Boost" value={payload.options_flow_boost} />
+                <DetailMetric label="Short Boost" value={payload.short_interest_boost} />
+                <DetailMetric label="Memory" value={memory.confidence_adjustment ?? memory.boost} />
+              </DetailGroup>
+
+              <DetailGroup title="Regime">
+                <PayloadMiniTable data={regime} />
+              </DetailGroup>
+            </div>
+          </motion.aside>
+        </>
+      )}
+    </AnimatePresence>
+  );
+}
+
+function DetailGroup({ title, children }: { title: string; children: ReactNode }) {
+  return (
+    <section className="rounded-xl border border-white/[0.06] bg-white/[0.025] p-4">
+      <h4 className="mb-3 font-space text-xs font-bold uppercase tracking-widest text-primary">{title}</h4>
+      <div className="grid grid-cols-2 gap-2">{children}</div>
+    </section>
+  );
+}
+
+function DetailMetric({ label, value, wide = false }: { label: string; value: unknown; wide?: boolean }) {
+  return (
+    <div className={cn("rounded-lg border border-white/[0.05] bg-base/50 p-2", wide && "col-span-2")}>
+      <p className="text-[9px] uppercase tracking-widest text-muted">{label}</p>
+      <p className="mt-1 break-words font-space text-xs font-bold text-primary">{formatDetailValue(value)}</p>
+    </div>
+  );
+}
+
+function NarrativeBlock({
+  title,
+  text,
+  tone = "neutral",
+}: {
+  title: string;
+  text: string | null;
+  tone?: "neutral" | "bad";
+}) {
+  if (!text) return null;
+  return (
+    <section className={cn("rounded-xl border p-4", tone === "bad" ? "border-danger/20 bg-danger/[0.06]" : "border-white/[0.06] bg-white/[0.025]")}>
+      <h4 className="mb-2 font-space text-xs font-bold uppercase tracking-widest text-primary">{title}</h4>
+      <p className="text-xs leading-relaxed text-muted">{text}</p>
+    </section>
+  );
+}
+
+function PayloadMiniTable({ data }: { data: Record<string, unknown> }) {
+  const entries = Object.entries(data).filter(([, value]) => value != null && value !== "");
+  if (entries.length === 0) {
+    return <DetailMetric label="Data" value={null} wide />;
+  }
+  return (
+    <div className="col-span-2 grid grid-cols-2 gap-2">
+      {entries.slice(0, 8).map(([key, value]) => (
+        <DetailMetric key={key} label={key.replaceAll("_", " ")} value={value} />
+      ))}
     </div>
   );
 }

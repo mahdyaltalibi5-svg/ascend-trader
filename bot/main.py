@@ -1338,6 +1338,7 @@ async def scan_symbol(
         si_boost = short_interest_confidence_boost(short_intel or {}, symbol, signal.get("signal", "hold"))
         signal["confidence"] = min(0.98, signal["confidence"] + si_boost)
         signal["short_interest_boost"] = si_boost
+        signal["_score"] = composite_score(signal, ind_5m, ind_1h, intel) + rs_boost
 
         # Step 4: AI Risk Officer veto check (only for actionable signals)
         signal["risk_officer_approved"] = True
@@ -1383,6 +1384,7 @@ async def scan_symbol(
             "accepted" if is_actionable else "analyzed",
             action=final_action,
             confidence=signal.get("confidence"),
+            composite_score=signal.get("_score"),
             setup_type=setup_type,
             setup_quality=setup_quality,
             catalyst_score=catalyst.total_score,
@@ -1390,10 +1392,54 @@ async def scan_symbol(
             risk_status="approved" if signal.get("risk_officer_approved", True) else "rejected",
             payload={
                 "reasoning":       signal.get("reasoning", ""),
+                "criteria_met":    signal.get("criteria_met"),
+                "entry_price":     signal.get("entry_price"),
+                "stop_loss":       signal.get("stop_loss"),
+                "take_profit":     signal.get("take_profit"),
+                "risk_reward_ratio": signal.get("risk_reward_ratio"),
+                "composite_score": signal.get("_score"),
                 "catalyst_note":   catalyst.catalyst_note,
+                "catalyst": {
+                    "total_score":    catalyst.total_score,
+                    "components":     catalyst.components,
+                    "fired":          catalyst.fired_catalysts,
+                    "dominant":       catalyst.dominant_catalyst,
+                },
                 "rs_note":         (rs_intel or {}).get(symbol, {}).get("rs_note", ""),
+                "relative_strength": rs_intel.get(symbol) if rs_intel else None,
                 "memory_note":     signal.get("memory_adjustment", {}).get("memory_note", ""),
+                "memory_adjustment": signal.get("memory_adjustment"),
+                "rs_boost":        signal.get("rs_boost"),
+                "insider_boost":   signal.get("insider_boost"),
+                "short_interest_boost": signal.get("short_interest_boost"),
                 "insider_context": insider_context,
+                "insider_flow": (
+                    insider_intel[symbol].as_dict()
+                    if insider_intel and symbol in insider_intel
+                    else None
+                ),
+                "options_flow_boost": signal.get("options_flow_boost"),
+                "options_flow": (
+                    options_flow_intel[symbol].as_dict()
+                    if options_flow_intel and symbol in options_flow_intel
+                    else None
+                ),
+                "short_interest": (
+                    short_intel[symbol].as_dict()
+                    if short_intel and symbol in short_intel
+                    else None
+                ),
+                "risk_officer": {
+                    "approved": signal.get("risk_officer_approved", True),
+                    "note":     signal.get("risk_officer_note", ""),
+                },
+                "setup": {
+                    "type": setup_type,
+                    "classification_confidence": setup_confidence,
+                    "quality": setup_quality,
+                    "min_confidence_required": min_confidence_required,
+                },
+                "trend":           mtf_trend(ind_5m, ind_1h, ind_1d),
                 "regime":          advanced_regime,
             },
         )
@@ -1402,7 +1448,6 @@ async def scan_symbol(
         signal["created_at"] = datetime.now(timezone.utc).isoformat()
         signal["strategy"]   = "ascend_elite_v3"
         signal["strength"]   = signal.get("confidence", 0)
-        signal["_score"]     = composite_score(signal, ind_5m, ind_1h, intel) + rs_boost
         signal["setup_type"] = setup_type
         signal["setup_quality"] = setup_quality
         signal["setup_confidence"] = setup_confidence
