@@ -5,6 +5,7 @@ import { useState, useCallback, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import {
   Activity,
+  AlertTriangle,
   ArrowUpRight,
   BarChart3,
   BrainCircuit,
@@ -42,7 +43,7 @@ import { useTrades } from "@/hooks/useTrades";
 import { useRealtime, useRealtimeSignals, useRealtimeTrades } from "@/hooks/useRealtime";
 import { createClient } from "@/lib/supabase/client";
 import { formatCurrency, pnlColor, cn } from "@/lib/utils";
-import type { BotLog, Signal } from "@/types";
+import type { BotLog, ScanEvent, Signal } from "@/types";
 
 const WATCHLIST = ["SPY", "NVDA", "AAPL", "TSLA", "MSFT", "AMZN"];
 
@@ -53,6 +54,10 @@ const INTELLIGENCE_LAYERS = [
   { label: "Risk Engine", detail: "Heat + correlation gates", icon: ShieldCheck, tone: "text-primary" },
   { label: "Earnings", detail: "Priority catalyst scan", icon: CalendarClock, tone: "text-amber-300" },
   { label: "13F Smart Money", detail: "Lagged fund positioning", icon: FileSearch, tone: "text-cyan" },
+  { label: "Form 4 Insiders", detail: "Open-market buying", icon: Wallet, tone: "text-success" },
+  { label: "Options Flow", detail: "Unusual calls / puts", icon: Activity, tone: "text-purple" },
+  { label: "Short Interest", detail: "Squeeze pressure", icon: Flame, tone: "text-amber-300" },
+  { label: "Signal Memory", detail: "Outcome calibration", icon: ListChecks, tone: "text-primary" },
 ];
 
 const QUICK_LINKS = [
@@ -98,10 +103,41 @@ function logIcon(level: BotLog["level"]) {
   return CheckCircle2;
 }
 
+function eventTone(event: ScanEvent) {
+  if (event.stage === "error" || event.risk_status === "rejected") return "text-danger";
+  if (event.stage === "rejected" || event.action === "veto") return "text-amber-300";
+  if (event.stage === "ordered" || event.stage === "accepted") return "text-success";
+  if (event.stage === "started") return "text-cyan";
+  return "text-primary";
+}
+
+function eventIcon(event: ScanEvent) {
+  if (event.stage === "error" || event.risk_status === "rejected") return XCircle;
+  if (event.stage === "rejected" || event.action === "veto") return AlertTriangle;
+  if (event.stage === "ordered" || event.stage === "accepted") return CheckCircle2;
+  return ScanLine;
+}
+
+function eventTitle(event: ScanEvent) {
+  const action = event.action ? event.action.toUpperCase() : event.stage.toUpperCase();
+  return `${event.symbol} ${action}`;
+}
+
+function eventSubtitle(event: ScanEvent) {
+  if (event.rejection_reason) return event.rejection_reason;
+  const payload = event.payload ?? {};
+  const reasoning = typeof payload.reasoning === "string" ? payload.reasoning : "";
+  const catalyst = typeof payload.catalyst_note === "string" ? payload.catalyst_note : "";
+  return reasoning || catalyst || `${event.stage} stage recorded`;
+}
+
 export default function DashboardPage() {
   const { portfolio, snapshots, loading: portfolioLoading } = usePortfolio();
   const { trades, loading: tradesLoading, refetch: refetchTrades } = useTrades({ status: "open", limit: 8 });
   const [signals, setSignals] = useState<Signal[]>([]);
+  const [scanEvents, setScanEvents] = useState<ScanEvent[]>([]);
+  const [selectedEvent, setSelectedEvent] = useState<ScanEvent | null>(null);
+  const [scanEventsAvailable, setScanEventsAvailable] = useState(true);
   const [botLogs, setBotLogs] = useState<BotLog[]>([]);
   const [sigLoading, setSigLoading] = useState(true);
   const [logsLoading, setLogsLoading] = useState(true);
@@ -130,6 +166,26 @@ export default function DashboardPage() {
 
   useEffect(() => {
     void supabase
+      .from("scan_events")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(10)
+      .then(({ data, error }) => {
+        if (error) {
+          setScanEventsAvailable(false);
+        } else {
+          const events = (data as ScanEvent[]) ?? [];
+          setScanEvents(events);
+          setSelectedEvent(events[0] ?? null);
+        }
+        setLogsLoading(false);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (scanEventsAvailable) return;
+    setLogsLoading(true);
+    void supabase
       .from("bot_logs")
       .select("*")
       .order("created_at", { ascending: false })
@@ -138,7 +194,7 @@ export default function DashboardPage() {
         setBotLogs((data as BotLog[]) ?? []);
         setLogsLoading(false);
       });
-  }, []);
+  }, [scanEventsAvailable]);
 
   const handleNewTrade = useCallback(() => refetchTrades(), [refetchTrades]);
   const handleNewSignal = useCallback((payload: Record<string, unknown>) => {
@@ -147,9 +203,16 @@ export default function DashboardPage() {
   const handleNewLog = useCallback((payload: Record<string, unknown>) => {
     setBotLogs((prev) => [payload.new as BotLog, ...prev].slice(0, 8));
   }, []);
+  const handleNewScanEvent = useCallback((payload: Record<string, unknown>) => {
+    const event = payload.new as ScanEvent;
+    setScanEventsAvailable(true);
+    setScanEvents((prev) => [event, ...prev].slice(0, 10));
+    setSelectedEvent((current) => current ?? event);
+  }, []);
 
   useRealtimeTrades(handleNewTrade);
   useRealtimeSignals(handleNewSignal);
+  useRealtime({ table: "scan_events", event: "INSERT", onData: handleNewScanEvent });
   useRealtime({ table: "bot_logs", event: "INSERT", onData: handleNewLog });
 
   const equity = portfolio?.equity ?? 0;
@@ -240,6 +303,8 @@ export default function DashboardPage() {
   ];
 
   const rejectedSignals = signals.filter((signal) => signal.signal === "hold").length;
+  const acceptedEvents = scanEvents.filter((event) => event.stage === "accepted" || event.stage === "ordered").length;
+  const rejectedEvents = scanEvents.filter((event) => event.stage === "rejected" || event.action === "veto").length;
   const topWatchlist = WATCHLIST.map((symbol) => ({
     symbol,
     signal: signals.find((item) => item.symbol === symbol),
@@ -322,12 +387,16 @@ export default function DashboardPage() {
                   <ScanLine className="h-4 w-4 text-cyan" />
                   <h2 className="font-space text-sm font-semibold text-primary">Bot Activity Tape</h2>
                 </div>
-                <p className="text-xs text-muted">Live scan decisions, risk blocks, orders, and outcome grading</p>
+                <p className="text-xs text-muted">
+                  {scanEventsAvailable
+                    ? "Structured scan events: analyzed, accepted, rejected, ordered, and errors"
+                    : "Text bot logs until scan_events migration is applied"}
+                </p>
               </div>
               <div className="flex items-center gap-2 rounded-lg border border-white/[0.08] bg-base/50 px-3 py-2">
                 <span className="h-1.5 w-1.5 rounded-full bg-cyan animate-pulse-slow" />
                 <span className="font-space text-[10px] font-semibold uppercase tracking-widest text-muted">
-                  Streaming
+                  {scanEventsAvailable ? "Scan Events" : "Bot Logs"}
                 </span>
               </div>
             </div>
@@ -345,11 +414,55 @@ export default function DashboardPage() {
                     </div>
                   ))}
                 </div>
+              ) : scanEventsAvailable && scanEvents.length === 0 ? (
+                <EmptyState
+                  icon={MessageSquareText}
+                  title="No scan events yet"
+                  detail="Once the Railway bot runs a scan, every symbol decision will stream here."
+                />
+              ) : scanEventsAvailable ? (
+                <div className="divide-y divide-white/[0.04]">
+                  {scanEvents.map((event, index) => {
+                    const Icon = eventIcon(event);
+                    const active = selectedEvent?.id === event.id;
+                    return (
+                      <button
+                        key={event.id}
+                        onClick={() => setSelectedEvent(event)}
+                        className={cn(
+                          "grid w-full grid-cols-[36px_1fr_86px] gap-3 px-5 py-3.5 text-left transition-colors hover:bg-white/[0.02]",
+                          active && "bg-cyan/[0.04]"
+                        )}
+                      >
+                        <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/[0.06] bg-white/[0.03]">
+                          <Icon className={cn("h-4 w-4", eventTone(event))} />
+                        </div>
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-space text-sm font-bold text-primary">{eventTitle(event)}</p>
+                            <span className="rounded-md border border-white/[0.06] px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-widest text-muted">
+                              {event.stage}
+                            </span>
+                          </div>
+                          <p className="mt-1 line-clamp-2 text-xs text-muted">{eventSubtitle(event)}</p>
+                          <div className="mt-2 flex flex-wrap gap-2">
+                            <TinyPill label="Conf" value={formatConfidence(event.confidence)} />
+                            <TinyPill label="Setup" value={event.setup_type ?? "--"} />
+                            <TinyPill label="Cat" value={event.catalyst_score != null ? `${event.catalyst_score.toFixed(1)}` : "--"} />
+                          </div>
+                        </div>
+                        <span className="pt-1 text-right text-[10px] text-muted">
+                          {formatRelativeTime(event.created_at)}
+                        </span>
+                      </button>
+                    );
+                  })}
+                </div>
               ) : botLogs.length === 0 ? (
                 <EmptyState
                   icon={MessageSquareText}
                   title="No bot activity yet"
-                  detail="Once Railway is connected and the scanner runs, every decision will stream here."
+                  detail="Once Railway is connected and the scanner runs, activity will stream here."
                 />
               ) : (
                 <div className="divide-y divide-white/[0.04]">
@@ -393,7 +506,7 @@ export default function DashboardPage() {
                 <p className="text-xs text-muted">The signal inputs feeding every Claude decision</p>
               </div>
               <span className="rounded-lg border border-purple/20 bg-purple/10 px-2.5 py-1 font-space text-[10px] font-bold text-purple">
-                6 layers
+                10 layers
               </span>
             </div>
 
@@ -423,11 +536,38 @@ export default function DashboardPage() {
                 <span className="font-space text-[10px] text-muted">{signals.length} recent signals</span>
               </div>
               <div className="grid grid-cols-3 gap-2">
-                <SignalMetric label="Passed" value={String(signalStats.actionable)} />
-                <SignalMetric label="Rejected" value={String(rejectedSignals)} />
+                <SignalMetric label="Passed" value={scanEventsAvailable ? String(acceptedEvents) : String(signalStats.actionable)} />
+                <SignalMetric label="Rejected" value={scanEventsAvailable ? String(rejectedEvents) : String(rejectedSignals)} />
                 <SignalMetric label="Avg Conf" value={formatConfidence(signalStats.avgConfidence)} />
               </div>
             </div>
+
+            {selectedEvent && (
+              <div className="mt-4 rounded-xl border border-white/[0.06] bg-base/50 p-4">
+                <div className="mb-3 flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-space text-xs font-bold text-primary">
+                      {selectedEvent.symbol} Decision Detail
+                    </p>
+                    <p className="mt-1 text-xs text-muted">
+                      {selectedEvent.scan_id}
+                    </p>
+                  </div>
+                  <span className={cn("font-space text-[10px] font-bold uppercase tracking-widest", eventTone(selectedEvent))}>
+                    {selectedEvent.risk_status ?? selectedEvent.stage}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <SignalMetric label="Action" value={selectedEvent.action ?? "--"} />
+                  <SignalMetric label="Score" value={selectedEvent.composite_score != null ? selectedEvent.composite_score.toFixed(2) : "--"} />
+                  <SignalMetric label="Setup Q" value={selectedEvent.setup_quality != null ? selectedEvent.setup_quality.toFixed(2) : "--"} />
+                  <SignalMetric label="RS" value={selectedEvent.rs_signal ?? "--"} />
+                </div>
+                <p className="mt-3 line-clamp-4 text-xs leading-relaxed text-muted">
+                  {eventSubtitle(selectedEvent)}
+                </p>
+              </div>
+            )}
           </section>
         </div>
 
@@ -795,6 +935,14 @@ function SignalMetric({ label, value }: { label: string; value: string }) {
       <p className="text-[9px] uppercase tracking-widest text-muted">{label}</p>
       <p className="mt-1 font-space text-xs font-bold text-primary">{value}</p>
     </div>
+  );
+}
+
+function TinyPill({ label, value }: { label: string; value: string }) {
+  return (
+    <span className="rounded-md border border-white/[0.06] bg-base/50 px-1.5 py-0.5 text-[9px] text-muted">
+      {label}: <span className="font-space font-semibold text-primary">{value}</span>
+    </span>
   );
 }
 

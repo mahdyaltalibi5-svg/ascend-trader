@@ -170,6 +170,24 @@ export interface BotLog {
   created_at: string;
 }
 
+export interface ScanEvent {
+  id: string;
+  scan_id: string;
+  symbol: string;
+  stage: "started" | "analyzed" | "rejected" | "accepted" | "ordered" | "error" | string;
+  action: "hold" | "buy" | "sell" | "veto" | "risk_fail" | "spread_fail" | string | null;
+  confidence: number | null;
+  composite_score: number | null;
+  setup_type: string | null;
+  setup_quality: number | null;
+  catalyst_score: number | null;
+  rs_signal: string | null;
+  risk_status: string | null;
+  rejection_reason: string | null;
+  payload: Record<string, unknown> | null;
+  created_at: string;
+}
+
 // ── Charts ────────────────────────────────────────────────────────────────────
 
 export interface Candle {
