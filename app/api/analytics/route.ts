@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createServiceClient } from "@/lib/supabase/server";
 
+export const dynamic = "force-dynamic";
+
 // ---------------------------------------------------------------------------
 // Sector map — symbol → sector
 // ---------------------------------------------------------------------------
@@ -63,13 +65,11 @@ export async function GET() {
       tradesRes,
       snapshotsRes,
       signalsCountRes,
-      signalOutcomesRes,
     ] = await Promise.all([
       supabase.from("portfolio").select("equity,daily_pnl").order("updated_at", { ascending: false }).limit(1),
       supabase.from("trades").select("symbol,side,pnl,entry_price,stop_loss,status").order("created_at", { ascending: false }),
       supabase.from("portfolio_snapshots").select("equity,daily_pnl,snapshot_at").order("snapshot_at", { ascending: true }),
       supabase.from("signals").select("id", { count: "exact", head: true }),
-      supabase.from("signal_outcomes").select("outcome_score").throwOnError ? null : null,
     ]);
 
     // signal_outcomes is optional — try separately, ignore if table missing

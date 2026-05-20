@@ -651,12 +651,17 @@ async def execute_signal(signal: dict, portfolio_value: float, open_positions_li
         avg_win_r=2.5,
         avg_loss_r=1.0,
     )
-    kelly_risk_dollars = portfolio_value * kelly_frac
 
     qty = calc_qty(portfolio_value, entry, stop)
-    # Scale qty by Kelly fraction relative to default RISK_PER_TRADE
+    # Scale qty by Kelly fraction relative to default RISK_PER_TRADE, then
+    # re-apply the portfolio-value cap so Kelly can reduce risk or increase
+    # conviction without bypassing max position exposure.
     kelly_scale = kelly_frac / RISK_PER_TRADE
     qty = max(1, int(qty * kelly_scale))
+    max_shares = int((portfolio_value * 0.05) / entry)
+    if max_shares <= 0:
+        return None
+    qty = max(1, min(qty, max_shares))
 
     if qty <= 0:
         return None
@@ -1292,20 +1297,20 @@ async def cancel_order(order_id: str):
 @app.post("/options/enable")
 async def enable_options_mode():
     """
-    Enable options execution mode. When active, high-confidence signals will
-    route to options orders (via options.py) in addition to equity scans.
-    Requires Alpaca options permissions on the connected account.
+    Enable options research mode. This keeps options visible to the system
+    while equity execution remains the only live order path until option
+    exits and monitoring are fully implemented.
     """
     bot_state["options_mode"] = True
-    await log_bot("Options mode ENABLED — high-confidence signals will use options execution", "info")
+    await log_bot("Options research mode ENABLED — options are advisory until execution monitoring is added", "info")
     return {"options_mode": True, "status": "enabled"}
 
 
 @app.post("/options/disable")
 async def disable_options_mode():
-    """Disable options execution mode; bot returns to equity-only orders."""
+    """Disable options research mode."""
     bot_state["options_mode"] = False
-    await log_bot("Options mode DISABLED — reverting to equity-only execution", "info")
+    await log_bot("Options research mode DISABLED", "info")
     return {"options_mode": False, "status": "disabled"}
 
 
@@ -1314,5 +1319,5 @@ async def options_status():
     """Return current options mode state."""
     return {
         "options_mode": bot_state["options_mode"],
-        "note": "Enable with POST /options/enable once Alpaca options permissions are confirmed.",
+        "note": "Advisory only until options exit monitoring and paper validation are complete.",
     }
