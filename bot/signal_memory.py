@@ -204,7 +204,7 @@ def _build_regime_memories(rows: list[dict]) -> dict[str, RegimeMemory]:
         # Best and worst setup types within this regime
         by_setup: dict[str, list[dict]] = {}
         for r in rrows:
-            st = r.get("strategy") or "unknown"
+            st = r.get("_setup_type") or r.get("strategy") or "unknown"
             by_setup.setdefault(st, []).append(r)
 
         setup_wrs = {
@@ -272,7 +272,7 @@ def _build_weakness_report(
     # Worst setups globally
     by_setup: dict[str, list[dict]] = {}
     for row in rows:
-        st = row.get("strategy") or "unknown"
+        st = row.get("_setup_type") or row.get("strategy") or "unknown"
         by_setup.setdefault(st, []).append(row)
     setup_wrs = {
         st: _win_rate(sr, "return_1d_pct")
@@ -466,12 +466,18 @@ async def build_memory_from_outcomes(supabase_client: Any) -> dict[str, SetupMem
         sig = r.pop("signals", {}) or {}
         # Extract regime from indicators if available
         indicators = sig.get("indicators") or {}
+        market_regime = sig.get("market_regime") or {}
         if isinstance(indicators, dict):
-            regime = indicators.get("regime") or indicators.get("advanced_regime") or "unknown"
+            regime = indicators.get("regime") or indicators.get("advanced_regime")
+            setup = indicators.get("setup") if isinstance(indicators.get("setup"), dict) else {}
         else:
-            regime = "unknown"
+            regime = None
+            setup = {}
+        if not regime and isinstance(market_regime, dict):
+            regime = market_regime.get("advanced_regime") or market_regime.get("regime")
         r.update(sig)
-        r["_regime"] = regime
+        r["_regime"] = regime or "unknown"
+        r["_setup_type"] = setup.get("type") or sig.get("strategy") or "unknown"
         flat_rows.append(r)
 
     # ---- Per-symbol memory ----
@@ -514,7 +520,7 @@ async def build_memory_from_outcomes(supabase_client: Any) -> dict[str, SetupMem
         best_regime  = max(regime_wrs, key=regime_wrs.get) if regime_wrs else "unknown"
         worst_regime = min(regime_wrs, key=regime_wrs.get) if regime_wrs else "unknown"
 
-        strategies = [r.get("strategy") or "unknown" for r in sym_rows]
+        strategies = [r.get("_setup_type") or r.get("strategy") or "unknown" for r in sym_rows]
         best_setup = _mode(strategies) or "unknown"
 
         memory[symbol] = SetupMemory(

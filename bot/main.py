@@ -601,6 +601,69 @@ async def get_market_regime() -> dict:
             "regime_rules": trading_rules_for_regime("unknown"),
         }
 
+
+def _exceptional_signal(signal: dict) -> bool:
+    """True when a signal is strong enough to survive defensive portfolio gates."""
+    confidence = float(signal.get("confidence", 0) or 0)
+    catalyst_score = float(signal.get("catalyst_score", 0) or 0)
+    rs_signal = str(signal.get("rs_signal") or "")
+    return (
+        confidence >= 0.90
+        and catalyst_score >= 0.60
+        and (signal.get("earnings_catalyst") or rs_signal == "leader")
+    )
+
+
+def apply_portfolio_regime_gate(signal: dict, regime: dict, regime_rules: dict) -> tuple[bool, str]:
+    """
+    Scan-level portfolio throttle.
+
+    Symbol analysis can still find good setups, but this gate decides whether
+    the portfolio should take new risk in this market tape.
+    """
+    advanced_regime = regime.get("advanced_regime") or regime.get("regime", "unknown")
+    action = signal.get("signal", "hold")
+    setup_type = signal.get("setup_type") or "unknown"
+    confidence = float(signal.get("confidence", 0) or 0)
+    catalyst_score = float(signal.get("catalyst_score", 0) or 0)
+    min_confidence = max(
+        float(signal.get("min_confidence_required", MIN_CONFIDENCE) or MIN_CONFIDENCE),
+        float(regime_rules.get("confidence_threshold", MIN_CONFIDENCE) or MIN_CONFIDENCE),
+    )
+    size_multiplier = float(regime_rules.get("size_multiplier", 1.0) or 1.0)
+    avoid_setups = set(regime_rules.get("avoid_setups") or [])
+    exceptional = _exceptional_signal(signal)
+
+    signal["min_confidence_required"] = min_confidence
+    signal["regime_size_multiplier"] = max(0.25, min(1.25, size_multiplier))
+    signal["portfolio_gate"] = {
+        "regime": advanced_regime,
+        "confidence_threshold": min_confidence,
+        "size_multiplier": signal["regime_size_multiplier"],
+        "rule_note": regime_rules.get("note", ""),
+        "exceptional_override": exceptional,
+    }
+
+    if action not in ("buy", "sell"):
+        return False, "not actionable"
+    if confidence < min_confidence:
+        return False, f"confidence {confidence:.0%} below portfolio threshold {min_confidence:.0%}"
+    if setup_type in avoid_setups and not exceptional:
+        return False, f"{setup_type} is on the avoid list for {advanced_regime}"
+    if advanced_regime in ("high_vol_panic", "unknown") and not exceptional:
+        return False, f"{advanced_regime} requires an exceptional catalyst/RS signal"
+    if advanced_regime == "risk_off" and action == "buy" and not exceptional:
+        return False, "risk-off tape blocks ordinary long entries"
+    if advanced_regime in ("risk_on", "trend_day") and action == "sell" and confidence < 0.85:
+        return False, f"{advanced_regime} requires 85%+ confidence for shorts"
+    if advanced_regime == "sector_rotation" and action == "buy":
+        rs_signal = str(signal.get("rs_signal") or "")
+        if rs_signal not in ("leader", "strong_leader") and catalyst_score < 0.65:
+            return False, "sector rotation only allows leaders or catalyst-heavy longs"
+
+    return True, "approved by portfolio regime gate"
+
+
 # ---------------------------------------------------------------------------
 # Claude AI analysis
 # ---------------------------------------------------------------------------
@@ -882,14 +945,23 @@ Veto if: ANY of checklist items 1-4 are true, or if 3+ of items 5-10 are true.""
 # ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
-def calc_qty(portfolio_value: float, entry: float, stop_loss: float, atr: Optional[float] = None) -> int:
+def calc_qty(
+    portfolio_value: float,
+    entry: float,
+    stop_loss: float,
+    atr: Optional[float] = None,
+    size_multiplier: float = 1.0,
+) -> int:
     risk_dollars   = portfolio_value * RISK_PER_TRADE
     risk_per_share = abs(entry - stop_loss)
     if risk_per_share <= 0:
         return 0
     shares     = int(risk_dollars / risk_per_share)
     max_shares = int((portfolio_value * 0.05) / entry)
-    return max(1, min(shares, max_shares))
+    base       = max(1, min(shares, max_shares))
+    # Regime-adjusted: panic shrinks to 25%, trend day grows to 150%, clamp both ends
+    mult       = max(0.25, min(1.5, size_multiplier))
+    return max(1, min(int(base * mult), max_shares))
 
 # ---------------------------------------------------------------------------
 # Circuit breaker
@@ -971,6 +1043,8 @@ async def execute_signal(signal: dict, portfolio_value: float, open_positions_li
     # conviction without bypassing max position exposure.
     kelly_scale = kelly_frac / RISK_PER_TRADE
     qty = max(1, int(qty * kelly_scale))
+    regime_size_multiplier = float(signal.get("regime_size_multiplier", 1.0) or 1.0)
+    qty = max(1, int(qty * max(0.25, min(1.25, regime_size_multiplier))))
     max_shares = int((portfolio_value * 0.05) / entry)
     if max_shares <= 0:
         return None
@@ -1452,6 +1526,8 @@ async def scan_symbol(
         signal["setup_quality"] = setup_quality
         signal["setup_confidence"] = setup_confidence
         signal["min_confidence_required"] = min_confidence_required
+        signal["catalyst_score"] = catalyst.total_score
+        signal["rs_signal"] = (rs_intel or {}).get(symbol, {}).get("rs_signal")
 
         db = require_supabase()
         signal_insert = db.table("signals").insert({
@@ -1469,6 +1545,7 @@ async def scan_symbol(
             "composite_score": signal.get("_score", 0),
             "strategy":   "ascend_elite_v3",
             "indicators": {
+                "regime": advanced_regime,
                 "5m":    ind_5m,
                 "1h":    ind_1h,
                 "1d":    ind_1d,
@@ -1720,9 +1797,40 @@ async def run_scan():
             base = sig.get("_score", 0)
             return base + (0.05 if sig.get("earnings_catalyst") else 0.0)
 
+        gated_signals: list[dict] = []
+        gate_rejections = 0
+        for signal in all_signals:
+            if signal.get("signal") not in ("buy", "sell"):
+                continue
+            approved, gate_reason = apply_portfolio_regime_gate(signal, regime, regime_rules)
+            signal["portfolio_gate"]["approved"] = approved
+            signal["portfolio_gate"]["reason"] = gate_reason
+            if approved:
+                gated_signals.append(signal)
+            else:
+                gate_rejections += 1
+                await write_scan_event(
+                    scan_id, signal["symbol"], "rejected",
+                    action="risk_fail",
+                    confidence=signal.get("confidence"),
+                    composite_score=signal.get("_score"),
+                    setup_type=signal.get("setup_type"),
+                    setup_quality=signal.get("setup_quality"),
+                    catalyst_score=signal.get("catalyst_score"),
+                    rs_signal=signal.get("rs_signal"),
+                    risk_status="portfolio_gate",
+                    rejection_reason=gate_reason,
+                    payload={
+                        "portfolio_gate": signal.get("portfolio_gate"),
+                        "regime": regime,
+                        "regime_rules": regime_rules,
+                        "reasoning": signal.get("reasoning", ""),
+                    },
+                )
+
         actionable = sorted(
             [
-                s for s in all_signals
+                s for s in gated_signals
                 if s.get("signal") in ("buy", "sell")
                 and s.get("confidence", 0) >= s.get("min_confidence_required", MIN_CONFIDENCE)
                 and s.get("risk_reward_ratio", 0) >= MIN_RR
@@ -1735,6 +1843,7 @@ async def run_scan():
         slots = max(0, max_positions_allowed - open_positions)
         await log_bot(
             f"{len(actionable)} high-conviction signals | {slots} slots | "
+            f"portfolio_gate_rejections={gate_rejections} | "
             f"circuit_breaker={bot_state['circuit_breaker_active']} | "
             f"no_trade={not trade_allowed} | "
             f"earnings_catalysts={len(earnings_symbols)}",
@@ -1781,6 +1890,8 @@ async def run_scan():
                                 "stop_loss":   signal.get("stop_loss"),
                                 "take_profit": signal.get("take_profit"),
                                 "rr":          signal.get("risk_reward_ratio"),
+                                "portfolio_gate": signal.get("portfolio_gate"),
+                                "regime_size_multiplier": signal.get("regime_size_multiplier"),
                                 "order_id":    order.get("id"),
                             },
                         )
