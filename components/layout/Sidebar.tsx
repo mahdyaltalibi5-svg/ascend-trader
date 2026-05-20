@@ -8,6 +8,7 @@ import {
   ArrowLeftRight,
   Zap,
   PieChart,
+  Beaker,
   Settings,
   TrendingUp,
 } from "lucide-react";
@@ -17,6 +18,7 @@ const nav = [
   { href: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { href: "/trades", icon: ArrowLeftRight, label: "Trades" },
   { href: "/signals", icon: Zap, label: "Signals" },
+  { href: "/backtest", icon: Beaker, label: "Research" },
   { href: "/portfolio", icon: PieChart, label: "Portfolio" },
   { href: "/settings", icon: Settings, label: "Settings" },
 ];

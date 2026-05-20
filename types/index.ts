@@ -28,7 +28,83 @@ export interface Signal {
   signal: "buy" | "sell" | "hold";
   strategy: string;
   strength: number;
-  indicators: Record<string, number | string> | null;
+  confidence: number | null;
+  criteria_met: number | null;
+  entry_price: number | null;
+  stop_loss: number | null;
+  take_profit: number | null;
+  risk_reward_ratio: number | null;
+  ai_reasoning: string | null;
+  market_regime: Record<string, number | string | boolean | null> | null;
+  composite_score: number | null;
+  executed: boolean;
+  signal_outcomes?: SignalOutcome[];
+  indicators: Record<string, unknown> | null;
+  created_at: string;
+}
+
+export interface SignalOutcome {
+  id: string;
+  signal_id: string;
+  symbol: string;
+  signal: "buy" | "sell" | "hold";
+  entry_price: number | null;
+  price_1h: number | null;
+  price_1d: number | null;
+  price_3d: number | null;
+  return_1h_pct: number | null;
+  return_1d_pct: number | null;
+  return_3d_pct: number | null;
+  max_favorable_pct: number | null;
+  max_adverse_pct: number | null;
+  hit_stop: boolean | null;
+  hit_take_profit: boolean | null;
+  outcome_score: number | null;
+  checked_at: string;
+}
+
+// ── Research Lab ─────────────────────────────────────────────────────────────
+
+export interface BacktestRun {
+  id: string;
+  strategy: string;
+  symbols: string[];
+  timeframe: string;
+  start_at: string;
+  end_at: string;
+  initial_equity: number;
+  final_equity: number;
+  total_return_pct: number;
+  max_drawdown_pct: number;
+  win_rate: number;
+  profit_factor: number;
+  expectancy_r: number;
+  sharpe: number;
+  total_trades: number;
+  winning_trades: number;
+  losing_trades: number;
+  config: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface BacktestTrade {
+  id: string;
+  run_id: string;
+  symbol: string;
+  side: "buy" | "sell";
+  entry_at: string;
+  exit_at: string;
+  entry_price: number;
+  exit_price: number;
+  stop_loss: number;
+  take_profit: number;
+  qty: number;
+  pnl: number;
+  r_multiple: number;
+  confidence: number;
+  criteria_met: number;
+  exit_reason: string;
+  indicators: Record<string, unknown>;
   created_at: string;
 }
 

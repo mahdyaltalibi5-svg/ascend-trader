@@ -8,6 +8,7 @@ import {
   LayoutDashboard,
   ArrowLeftRight,
   Zap,
+  Beaker,
   BrainCircuit,
   Settings,
   ChevronRight,
@@ -20,6 +21,7 @@ const NAV = [
   { href: "/dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { href: "/trades",    icon: ArrowLeftRight,  label: "Trades"    },
   { href: "/signals",   icon: Zap,             label: "Signals"   },
+  { href: "/backtest",  icon: Beaker,          label: "Research"  },
   { href: "/analyst",   icon: BrainCircuit,    label: "Analyst"   },
   { href: "/settings",  icon: Settings,        label: "Settings"  },
 ];

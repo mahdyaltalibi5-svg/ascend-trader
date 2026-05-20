@@ -8,7 +8,7 @@ import os
 import json
 import asyncio
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import numpy as np
@@ -20,6 +20,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from supabase import create_client, Client
 import anthropic
 from dotenv import load_dotenv
+from backtest import fetch_historical_bars, parse_config, run_research_backtest
 
 load_dotenv()
 
@@ -77,6 +78,7 @@ bot_state = {
     "last_scan_at":            None,
     "last_signal_at":          None,
     "last_monitor_at":         None,
+    "last_outcome_eval_at":    None,
     "trades_today":            0,
     "signals_today":           0,
     "wins_today":              0,
@@ -256,6 +258,132 @@ def composite_score(signal: dict, ind_5m: dict, ind_1h: dict) -> float:
     bonus_mom  = min(roc / 20.0, 0.10)        # up to +10% for strong momentum
     bonus_rr   = min((rr - MIN_RR) / 10.0, 0.10)  # up to +10% for great R/R
     return conf + bonus_vol + bonus_mom + bonus_rr
+
+
+def _parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
+def _directional_return(side: str, entry: float, price: float | None) -> float | None:
+    if price is None or entry <= 0:
+        return None
+    raw = (price - entry) / entry * 100
+    return raw if side == "buy" else -raw
+
+
+def _price_at_or_after(bars: pd.DataFrame, ts: datetime) -> float | None:
+    if bars.empty:
+        return None
+    target = pd.Timestamp(ts)
+    if target.tzinfo is None:
+        target = target.tz_localize("UTC")
+    future = bars[bars.index >= target]
+    if future.empty:
+        return None
+    return float(future.iloc[0]["close"])
+
+
+def _outcome_score(values: list[float | None], hit_stop: bool, hit_target: bool) -> float:
+    available = [v for v in values if v is not None]
+    if not available:
+        return 0.0
+    score = sum(available) / len(available)
+    if hit_target:
+        score += 1.5
+    if hit_stop:
+        score -= 1.5
+    return round(score, 3)
+
+
+async def evaluate_signal_outcomes(limit: int = 40) -> dict:
+    """Grade old signals against what actually happened after the call."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    res = (
+        supabase.table("signals")
+        .select("id,symbol,signal,entry_price,stop_loss,take_profit,created_at,outcome_checked_at")
+        .in_("signal", ["buy", "sell"])
+        .lte("created_at", cutoff)
+        .order("created_at", desc=False)
+        .limit(limit)
+        .execute()
+    )
+
+    evaluated = 0
+    skipped = 0
+    errors = 0
+
+    for sig in res.data or []:
+        try:
+            if sig.get("outcome_checked_at"):
+                checked = _parse_ts(sig["outcome_checked_at"])
+                created = _parse_ts(sig["created_at"])
+                if checked >= created + timedelta(days=3):
+                    skipped += 1
+                    continue
+                if checked > datetime.now(timezone.utc) - timedelta(hours=12):
+                    skipped += 1
+                    continue
+
+            created_at = _parse_ts(sig["created_at"])
+            end_at = min(datetime.now(timezone.utc), created_at + timedelta(days=4))
+            bars = await fetch_historical_bars(sig["symbol"], "1Hour", created_at, end_at)
+            if bars.empty:
+                skipped += 1
+                continue
+
+            entry = float(sig.get("entry_price") or bars.iloc[0]["close"])
+            price_1h = _price_at_or_after(bars, created_at + timedelta(hours=1))
+            price_1d = _price_at_or_after(bars, created_at + timedelta(days=1))
+            price_3d = _price_at_or_after(bars, created_at + timedelta(days=3))
+
+            side = sig["signal"]
+            elapsed = bars.iloc[1:] if len(bars) > 1 else bars
+            if side == "buy":
+                max_favorable = (float(elapsed["high"].max()) - entry) / entry * 100
+                max_adverse = (float(elapsed["low"].min()) - entry) / entry * 100
+                hit_stop = bool(sig.get("stop_loss") and float(elapsed["low"].min()) <= float(sig["stop_loss"]))
+                hit_target = bool(sig.get("take_profit") and float(elapsed["high"].max()) >= float(sig["take_profit"]))
+            else:
+                max_favorable = (entry - float(elapsed["low"].min())) / entry * 100
+                max_adverse = (entry - float(elapsed["high"].max())) / entry * 100
+                hit_stop = bool(sig.get("stop_loss") and float(elapsed["high"].max()) >= float(sig["stop_loss"]))
+                hit_target = bool(sig.get("take_profit") and float(elapsed["low"].min()) <= float(sig["take_profit"]))
+
+            ret_1h = _directional_return(side, entry, price_1h)
+            ret_1d = _directional_return(side, entry, price_1d)
+            ret_3d = _directional_return(side, entry, price_3d)
+            score = _outcome_score([ret_1h, ret_1d, ret_3d], hit_stop, hit_target)
+            checked_at = datetime.now(timezone.utc).isoformat()
+
+            supabase.table("signal_outcomes").upsert(
+                {
+                    "signal_id": sig["id"],
+                    "symbol": sig["symbol"],
+                    "signal": side,
+                    "entry_price": round(entry, 4),
+                    "price_1h": round(price_1h, 4) if price_1h is not None else None,
+                    "price_1d": round(price_1d, 4) if price_1d is not None else None,
+                    "price_3d": round(price_3d, 4) if price_3d is not None else None,
+                    "return_1h_pct": round(ret_1h, 3) if ret_1h is not None else None,
+                    "return_1d_pct": round(ret_1d, 3) if ret_1d is not None else None,
+                    "return_3d_pct": round(ret_3d, 3) if ret_3d is not None else None,
+                    "max_favorable_pct": round(max_favorable, 3),
+                    "max_adverse_pct": round(max_adverse, 3),
+                    "hit_stop": hit_stop,
+                    "hit_take_profit": hit_target,
+                    "outcome_score": score,
+                    "checked_at": checked_at,
+                },
+                on_conflict="signal_id",
+            ).execute()
+            supabase.table("signals").update({"outcome_checked_at": checked_at}).eq("id", sig["id"]).execute()
+            evaluated += 1
+        except Exception as e:
+            errors += 1
+            await log_bot(f"Signal outcome error [{sig.get('symbol')}]: {e}", "error")
+
+    bot_state["last_outcome_eval_at"] = datetime.now(timezone.utc).isoformat()
+    return {"evaluated": evaluated, "skipped": skipped, "errors": errors}
 
 # ---------------------------------------------------------------------------
 # Market regime
@@ -482,8 +610,13 @@ async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]
         "strategy":         "ascend_elite_v3",
         "confidence_score": signal.get("confidence"),
         "ai_reasoning":     signal.get("reasoning", ""),
+        "entry_at":         datetime.now(timezone.utc).isoformat(),
         "created_at":       datetime.now(timezone.utc).isoformat(),
     }).execute()
+
+    signal_id = signal.get("signal_id")
+    if signal_id:
+        supabase.table("signals").update({"executed": True}).eq("id", signal_id).execute()
 
     bot_state["trades_today"] += 1
     return order
@@ -700,10 +833,19 @@ async def scan_symbol(
         signal["strength"]   = signal.get("confidence", 0)
         signal["_score"]     = composite_score(signal, ind_5m, ind_1h)
 
-        supabase.table("signals").insert({
+        signal_insert = supabase.table("signals").insert({
             "symbol":     symbol,
             "signal":     signal.get("signal", "hold"),
             "strength":   signal["strength"],
+            "confidence": signal.get("confidence", 0),
+            "criteria_met": signal.get("criteria_met"),
+            "entry_price": signal.get("entry_price"),
+            "stop_loss": signal.get("stop_loss"),
+            "take_profit": signal.get("take_profit"),
+            "risk_reward_ratio": signal.get("risk_reward_ratio"),
+            "ai_reasoning": signal.get("reasoning", ""),
+            "market_regime": regime,
+            "composite_score": signal.get("_score", 0),
             "strategy":   "ascend_elite_v3",
             "indicators": {
                 "5m":    ind_5m,
@@ -713,6 +855,8 @@ async def scan_symbol(
             },
             "created_at": signal["created_at"],
         }).execute()
+        if signal_insert.data:
+            signal["signal_id"] = signal_insert.data[0].get("id")
 
         bot_state["last_signal_at"]  = signal["created_at"]
         bot_state["signals_today"]  += 1
@@ -814,6 +958,13 @@ async def run_scan():
 
         await sync_portfolio(account)
         await update_performance()
+        outcome_stats = await evaluate_signal_outcomes(limit=20)
+        if outcome_stats["evaluated"]:
+            await log_bot(
+                f"Outcome evaluator graded {outcome_stats['evaluated']} signals "
+                f"({outcome_stats['errors']} errors)",
+                "info",
+            )
 
         bot_state["scan_count"]  += 1
         bot_state["last_scan_at"] = datetime.now(timezone.utc).isoformat()
@@ -937,6 +1088,77 @@ async def get_performance():
         "day_pnl_pct":  bot_state["day_pnl"],
         "scan_count":   bot_state["scan_count"],
     }
+
+
+@app.post("/signals/evaluate")
+async def evaluate_signals(limit: int = 40):
+    try:
+        result = await evaluate_signal_outcomes(limit=limit)
+        await log_bot(
+            f"Manual outcome evaluation | graded={result['evaluated']} | "
+            f"skipped={result['skipped']} | errors={result['errors']}",
+            "info" if result["errors"] == 0 else "warning",
+        )
+        return result
+    except Exception as e:
+        await log_bot(f"Outcome evaluation failed: {e}", "error")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/signal-outcomes")
+async def list_signal_outcomes(limit: int = 100):
+    res = (
+        supabase.table("signal_outcomes")
+        .select("*")
+        .order("checked_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data
+
+
+@app.post("/backtest")
+async def create_backtest(payload: dict | None = None):
+    """Run a deterministic research backtest and persist the full run."""
+    try:
+        config = parse_config(payload)
+        result = await run_research_backtest(config, supabase)
+        await log_bot(
+            f"Backtest complete | {result['total_trades']} trades | "
+            f"return={result['total_return_pct']:.2f}% | "
+            f"dd={result['max_drawdown_pct']:.2f}% | "
+            f"pf={result['profit_factor']:.2f}",
+            "info",
+        )
+        return result
+    except Exception as e:
+        await log_bot(f"Backtest failed: {e}", "error")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/backtests")
+async def list_backtests(limit: int = 10):
+    res = (
+        supabase.table("backtest_runs")
+        .select("*")
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data
+
+
+@app.get("/backtests/{run_id}/trades")
+async def list_backtest_trades(run_id: str, limit: int = 100):
+    res = (
+        supabase.table("backtest_trades")
+        .select("*")
+        .eq("run_id", run_id)
+        .order("entry_at", desc=True)
+        .limit(limit)
+        .execute()
+    )
+    return res.data
 
 
 @app.delete("/order/{order_id}")
