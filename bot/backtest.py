@@ -22,9 +22,11 @@ from supabase import Client
 
 
 ALPACA_DATA_URL = "https://data.alpaca.markets"
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
 ALPACA_HEADERS = {
-    "APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
-    "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
+    "APCA-API-KEY-ID": ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
 
 DEFAULT_SYMBOLS = ["NVDA", "TSLA", "AMD", "META", "AMZN", "MSFT", "AAPL", "PLTR"]
@@ -55,6 +57,9 @@ async def fetch_historical_bars(
     start_at: datetime,
     end_at: datetime,
 ) -> pd.DataFrame:
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise RuntimeError("Alpaca API keys are not configured")
+
     rows: list[dict[str, Any]] = []
     page_token = None
 

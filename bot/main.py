@@ -55,18 +55,40 @@ BATCH_SIZE          = 5       # symbols per concurrent batch
 # ---------------------------------------------------------------------------
 # Clients
 # ---------------------------------------------------------------------------
-supabase: Client = create_client(
-    os.environ["NEXT_PUBLIC_SUPABASE_URL"],
-    os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+SUPABASE_URL = os.getenv("NEXT_PUBLIC_SUPABASE_URL", "")
+SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ALPACA_API_KEY = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+
+supabase: Client | None = (
+    create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+    if SUPABASE_URL and SUPABASE_SERVICE_KEY and "your-" not in SUPABASE_SERVICE_KEY
+    else None
 )
-claude = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+claude = (
+    anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    if ANTHROPIC_API_KEY and "your-" not in ANTHROPIC_API_KEY
+    else None
+)
 
 ALPACA_TRADE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 ALPACA_DATA_URL  = "https://data.alpaca.markets"
 ALPACA_HEADERS   = {
-    "APCA-API-KEY-ID":     os.environ["ALPACA_API_KEY"],
-    "APCA-API-SECRET-KEY": os.environ["ALPACA_SECRET_KEY"],
+    "APCA-API-KEY-ID":     ALPACA_API_KEY,
+    "APCA-API-SECRET-KEY": ALPACA_SECRET_KEY,
 }
+
+
+def require_supabase() -> Client:
+    if supabase is None:
+        raise HTTPException(500, "Supabase service role key is not configured")
+    return supabase
+
+
+def require_alpaca_keys():
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        raise HTTPException(500, "Alpaca API keys are not configured")
 
 # ---------------------------------------------------------------------------
 # State
@@ -96,6 +118,7 @@ monitor_task: Optional[asyncio.Task] = None
 # Alpaca helpers
 # ---------------------------------------------------------------------------
 async def alpaca_get(path: str, base: str = ALPACA_TRADE_URL) -> dict | list:
+    require_alpaca_keys()
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{base}{path}", headers=ALPACA_HEADERS)
         r.raise_for_status()
@@ -103,6 +126,7 @@ async def alpaca_get(path: str, base: str = ALPACA_TRADE_URL) -> dict | list:
 
 
 async def alpaca_post(path: str, payload: dict) -> dict:
+    require_alpaca_keys()
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(
             f"{ALPACA_TRADE_URL}{path}", json=payload, headers=ALPACA_HEADERS
@@ -112,6 +136,7 @@ async def alpaca_post(path: str, payload: dict) -> dict:
 
 
 async def alpaca_delete(path: str) -> bool:
+    require_alpaca_keys()
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.delete(f"{ALPACA_TRADE_URL}{path}", headers=ALPACA_HEADERS)
         return r.status_code in (200, 204)
@@ -297,9 +322,10 @@ def _outcome_score(values: list[float | None], hit_stop: bool, hit_target: bool)
 
 async def evaluate_signal_outcomes(limit: int = 40) -> dict:
     """Grade old signals against what actually happened after the call."""
+    db = require_supabase()
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     res = (
-        supabase.table("signals")
+        db.table("signals")
         .select("id,symbol,signal,entry_price,stop_loss,take_profit,created_at,outcome_checked_at")
         .in_("signal", ["buy", "sell"])
         .lte("created_at", cutoff)
@@ -355,7 +381,7 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
             score = _outcome_score([ret_1h, ret_1d, ret_3d], hit_stop, hit_target)
             checked_at = datetime.now(timezone.utc).isoformat()
 
-            supabase.table("signal_outcomes").upsert(
+            db.table("signal_outcomes").upsert(
                 {
                     "signal_id": sig["id"],
                     "symbol": sig["symbol"],
@@ -376,7 +402,7 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
                 },
                 on_conflict="signal_id",
             ).execute()
-            supabase.table("signals").update({"outcome_checked_at": checked_at}).eq("id", sig["id"]).execute()
+            db.table("signals").update({"outcome_checked_at": checked_at}).eq("id", sig["id"]).execute()
             evaluated += 1
         except Exception as e:
             errors += 1
@@ -433,6 +459,14 @@ async def analyze_with_claude(
     portfolio_value: float,
     open_positions: int,
 ) -> dict:
+    if claude is None:
+        return {
+            "signal": "hold",
+            "confidence": 0,
+            "criteria_met": 0,
+            "reasoning": "Anthropic API key is not configured",
+        }
+
     trend = mtf_trend(ind_5m, ind_1h, ind_1d)
 
     news_text = "\n".join(
@@ -599,7 +633,8 @@ async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]
 
     order = await alpaca_post("/v2/orders", payload)
 
-    supabase.table("trades").insert({
+    db = require_supabase()
+    db.table("trades").insert({
         "symbol":           symbol,
         "side":             side,
         "qty":              qty,
@@ -616,7 +651,7 @@ async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]
 
     signal_id = signal.get("signal_id")
     if signal_id:
-        supabase.table("signals").update({"executed": True}).eq("id", signal_id).execute()
+        db.table("signals").update({"executed": True}).eq("id", signal_id).execute()
 
     bot_state["trades_today"] += 1
     return order
@@ -644,8 +679,9 @@ async def monitor_positions():
             unreal  = float(pos["unrealized_pl"])
 
             # Fetch original trade record for stop/target
+            db = require_supabase()
             res = (
-                supabase.table("trades")
+                db.table("trades")
                 .select("stop_loss, exit_price, id")
                 .eq("symbol", symbol)
                 .eq("status", "open")
@@ -693,7 +729,7 @@ async def monitor_positions():
                     await _replace_stop(symbol, qty, "buy", new_stop, open_orders, orig_stop)
 
             # Sync live P&L to Supabase
-            supabase.table("trades").update({"pnl": round(unreal, 2)}).eq("id", trade["id"]).execute()
+            db.table("trades").update({"pnl": round(unreal, 2)}).eq("id", trade["id"]).execute()
 
         bot_state["last_monitor_at"] = datetime.now(timezone.utc).isoformat()
 
@@ -734,7 +770,7 @@ async def _replace_stop(
             "info",
         )
         # Update Supabase stop_loss
-        supabase.table("trades").update({"stop_loss": round(new_stop, 2)}).eq("symbol", symbol).eq("status", "open").execute()
+        require_supabase().table("trades").update({"stop_loss": round(new_stop, 2)}).eq("symbol", symbol).eq("status", "open").execute()
     except Exception as e:
         await log_bot(f"[{symbol}] Stop replace failed: {e}", "error")
 
@@ -746,7 +782,7 @@ async def update_performance():
     try:
         today = datetime.now(timezone.utc).date().isoformat()
         res = (
-            supabase.table("trades")
+            require_supabase().table("trades")
             .select("pnl, status")
             .eq("status", "closed")
             .execute()
@@ -770,7 +806,7 @@ async def update_performance():
 async def sync_portfolio(account: dict):
     try:
         equity = float(account.get("equity", 0))
-        supabase.table("portfolio").upsert({
+        require_supabase().table("portfolio").upsert({
             "id":           1,
             "equity":       equity,
             "cash":         float(account.get("cash", 0)),
@@ -787,6 +823,8 @@ async def sync_portfolio(account: dict):
 # ---------------------------------------------------------------------------
 async def log_bot(message: str, level: str = "info"):
     try:
+        if supabase is None:
+            return
         supabase.table("bot_logs").insert({
             "message":    message,
             "level":      level,
@@ -833,7 +871,8 @@ async def scan_symbol(
         signal["strength"]   = signal.get("confidence", 0)
         signal["_score"]     = composite_score(signal, ind_5m, ind_1h)
 
-        signal_insert = supabase.table("signals").insert({
+        db = require_supabase()
+        signal_insert = db.table("signals").insert({
             "symbol":     symbol,
             "signal":     signal.get("signal", "hold"),
             "strength":   signal["strength"],
@@ -1108,7 +1147,7 @@ async def evaluate_signals(limit: int = 40):
 @app.get("/signal-outcomes")
 async def list_signal_outcomes(limit: int = 100):
     res = (
-        supabase.table("signal_outcomes")
+        require_supabase().table("signal_outcomes")
         .select("*")
         .order("checked_at", desc=True)
         .limit(limit)
@@ -1122,7 +1161,7 @@ async def create_backtest(payload: dict | None = None):
     """Run a deterministic research backtest and persist the full run."""
     try:
         config = parse_config(payload)
-        result = await run_research_backtest(config, supabase)
+        result = await run_research_backtest(config, require_supabase())
         await log_bot(
             f"Backtest complete | {result['total_trades']} trades | "
             f"return={result['total_return_pct']:.2f}% | "
@@ -1139,7 +1178,7 @@ async def create_backtest(payload: dict | None = None):
 @app.get("/backtests")
 async def list_backtests(limit: int = 10):
     res = (
-        supabase.table("backtest_runs")
+        require_supabase().table("backtest_runs")
         .select("*")
         .order("created_at", desc=True)
         .limit(limit)
@@ -1151,7 +1190,7 @@ async def list_backtests(limit: int = 10):
 @app.get("/backtests/{run_id}/trades")
 async def list_backtest_trades(run_id: str, limit: int = 100):
     res = (
-        supabase.table("backtest_trades")
+        require_supabase().table("backtest_trades")
         .select("*")
         .eq("run_id", run_id)
         .order("entry_at", desc=True)
