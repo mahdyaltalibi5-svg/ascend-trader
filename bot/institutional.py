@@ -12,10 +12,9 @@ Data source: SEC EDGAR (100% free, no API key required).
 from __future__ import annotations
 
 import asyncio
-import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Optional
 import httpx
 
@@ -28,6 +27,7 @@ SEC_HEADERS  = {
     # SEC requires a descriptive User-Agent
     "User-Agent": "AscendTrader research@ascendtrader.ai",
     "Accept":     "application/json",
+    "Accept-Encoding": "gzip, deflate",
 }
 
 # ---------------------------------------------------------------------------
@@ -144,28 +144,30 @@ async def fetch_recent_13f_urls(cik: str, n: int = 2) -> list[tuple[str, str]]:
 
 async def fetch_13f_xml_url(cik: str, accno: str) -> Optional[str]:
     """Find the primary XML document URL inside a 13F filing."""
-    index_url = f"{EDGAR_BASE}/Archives/edgar/data/{int(cik)}/{accno}/{accno}-index.json"
+    # The archive directory uses the accession number without dashes. The
+    # machine-readable directory listing is always named index.json.
+    archive_base = f"{EDGAR_BASE}/Archives/edgar/data/{int(cik)}/{accno}"
+    index_url = f"{archive_base}/index.json"
     async with httpx.AsyncClient(timeout=20) as client:
         try:
             data = await _get(client, index_url)
         except Exception:
-            # Try alternate index format
-            fmt_accno = f"{accno[:10]}-{accno[10:12]}-{accno[12:]}"
-            index_url = f"{EDGAR_BASE}/cgi-bin/browse-edgar?action=getcompany&CIK={cik}&type=13F-HR&dateb=&owner=include&count=5&search_text="
             return None
 
     for doc in data.get("directory", {}).get("item", []):
         name = doc.get("name", "")
-        if name.endswith(".xml") and "primary_doc" not in name.lower():
+        name_lower = name.lower()
+        if name_lower.endswith(".xml") and "primary_doc" not in name_lower:
             # The holdings XML is usually named like "informationTable.xml"
-            if any(kw in name.lower() for kw in ["information", "holdings", "primary"]):
-                return f"{EDGAR_BASE}/Archives/edgar/data/{int(cik)}/{accno}/{name}"
+            if any(kw in name_lower for kw in ["information", "infotable", "holdings"]):
+                return f"{archive_base}/{name}"
 
     # Fallback: scan index for any XML that isn't the submission form
     for doc in data.get("directory", {}).get("item", []):
         name = doc.get("name", "")
-        if name.endswith(".xml") and "xbrl" not in name.lower():
-            return f"{EDGAR_BASE}/Archives/edgar/data/{int(cik)}/{accno}/{name}"
+        name_lower = name.lower()
+        if name_lower.endswith(".xml") and "xbrl" not in name_lower and "primary_doc" not in name_lower:
+            return f"{archive_base}/{name}"
 
     return None
 
@@ -174,57 +176,42 @@ def _parse_holdings_xml(xml_text: str) -> list[Holding]:
     """Parse 13F informationTable XML into Holding objects."""
     holdings = []
 
-    # Strip namespaces for easier parsing
-    xml_clean = re.sub(r'\s+xmlns[^"]*"[^"]*"', "", xml_text)
-    xml_clean = re.sub(r'<(/?)ns\d+:', r'<\1', xml_clean)
-
     try:
-        root = ET.fromstring(xml_clean)
+        root = ET.fromstring(xml_text)
     except ET.ParseError:
         return []
 
-    # Handle both namespaced and plain elements
-    for entry in root.iter():
-        if entry.tag.lower() in ("infotable", "information_table_entry"):
-            break
+    def local_name(tag: str) -> str:
+        return tag.rsplit("}", 1)[-1].lower()
 
-    # Try direct iteration
-    entries = (
-        root.findall(".//infoTable") or
-        root.findall(".//{*}infoTable") or
-        list(root)
-    )
+    def child_text(entry: ET.Element, tag: str) -> str:
+        tag_lower = tag.lower()
+        for el in entry.iter():
+            if local_name(el.tag) == tag_lower and el.text:
+                return el.text.strip()
+        return ""
+
+    def shares_val(entry: ET.Element) -> int:
+        raw = child_text(entry, "sshPrnamt")
+        try:
+            return int(raw.replace(",", "")) if raw else 0
+        except Exception:
+            return 0
+
+    entries = [entry for entry in root.iter() if local_name(entry.tag) == "infotable"]
+    if not entries:
+        entries = [entry for entry in root.iter() if local_name(entry.tag) == "information_table_entry"]
 
     for entry in entries:
-        def txt(tag: str) -> str:
-            el = (
-                entry.find(tag) or
-                entry.find(tag.lower()) or
-                entry.find(f"{{*}}{tag}")
-            )
-            return el.text.strip() if el is not None and el.text else ""
-
-        def shares_val() -> int:
-            # Shares can be nested under shsOrPrnAmt/sshPrnamt
-            el = (
-                entry.find(".//sshPrnamt") or
-                entry.find(".//{*}sshPrnamt") or
-                entry.find(".//sshprnamtType")
-            )
-            try:
-                return int(el.text.strip().replace(",", "")) if el is not None and el.text else 0
-            except Exception:
-                return 0
-
-        name  = txt("nameOfIssuer") or txt("nameofissuer")
-        cusip = txt("cusip")
+        name = child_text(entry, "nameOfIssuer")
+        cusip = child_text(entry, "cusip")
         try:
-            value = int(txt("value").replace(",", "") or "0")
+            value = int(child_text(entry, "value").replace(",", "") or "0")
         except Exception:
             value = 0
 
         if name and cusip and value > 0:
-            holdings.append(Holding(name=name.upper(), cusip=cusip, value=value, shares=shares_val()))
+            holdings.append(Holding(name=name.upper(), cusip=cusip, value=value, shares=shares_val(entry)))
 
     return holdings
 
@@ -404,7 +391,7 @@ def build_institutional_context(intel: dict[str, InstitutionalIntel], symbol: st
         return f"INSTITUTIONAL POSITIONING: No major fund coverage. Retail-driven name — higher risk."
 
     lines = [
-        f"INSTITUTIONAL POSITIONING ({info.signal.upper()}):",
+        f"INSTITUTIONAL POSITIONING ({info.signal.upper()}, 13F LAGGED QUARTERLY DATA):",
         f"  Funds holding: {info.funds_holding}/{len(TOP_FUNDS)} elite funds | Total value: ${info.total_value_mm:.0f}M",
         f"  Conviction score: {info.conviction_score:.2f}/1.0",
     ]
@@ -414,8 +401,8 @@ def build_institutional_context(intel: dict[str, InstitutionalIntel], symbol: st
         lines.append(f"  REDUCING (last quarter): {', '.join(info.recent_reducers[:3])}")
 
     guidance = {
-        "accumulating": "Smart money is BUYING. Trade aligned with institutional flow.",
-        "distributing": "Smart money is SELLING. Trade with extreme caution — large players exiting.",
+        "accumulating": "Recent 13F filings show increased ownership. Treat as a slow institutional tailwind, not an intraday catalyst.",
+        "distributing": "Recent 13F filings show reduced ownership. Treat as a slow institutional headwind, not a real-time sell signal.",
         "neutral":      "Institutional positioning is stable. Neutral factor.",
     }
     lines.append(f"  Interpretation: {guidance.get(info.signal, '')}")
@@ -438,15 +425,16 @@ def institutional_signal_boost(intel: dict[str, InstitutionalIntel], symbol: str
 
     info = intel[symbol]
     side = signal_side.lower()
+    strength = max(0.25, min(1.0, info.conviction_score))
 
     if info.signal == "accumulating" and side == "buy":
-        return 0.10   # trading WITH the smart money
+        return 0.10 * strength   # trading WITH the smart money
     if info.signal == "distributing" and side == "sell":
-        return 0.10   # shorting what they're dumping
+        return 0.08 * strength   # shorting what filings show they reduced
     if info.signal == "accumulating" and side == "sell":
-        return -0.15  # shorting what Citadel is buying — very risky
+        return -0.15 * strength  # shorting against institutional accumulation
     if info.signal == "distributing" and side == "buy":
-        return -0.15  # buying what smart money is selling — very risky
+        return -0.12 * strength  # buying into institutional reduction
 
     return 0.0
 
