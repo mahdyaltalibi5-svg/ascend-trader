@@ -27,14 +27,19 @@ from institutional import get_cached_intel, build_institutional_context, institu
 from no_trade_calendar import get_calendar_context, should_trade_now
 from regime_brain import get_full_regime, trading_rules_for_regime
 from setup_classifier import classify_setup, score_setup_quality, setup_notes_for_claude
+from relative_strength import get_relative_strength_intel, build_rs_prompt_section, rs_score_boost
+from catalyst_stack import build_catalyst_score, build_catalyst_prompt_section, catalyst_confidence_boost, minimum_catalyst_threshold
+from insider_flow import get_insider_intel, build_insider_prompt_section, insider_confidence_boost, InsiderIntel
+from options_flow import get_options_flow_intel, build_options_flow_prompt_section, options_flow_confidence_boost
+from short_interest import get_short_interest_intel, build_short_interest_prompt_section, short_interest_confidence_boost
 from signal_memory import (
     build_memory_from_outcomes,
     build_memory_prompt_section,
     get_setup_historical_accuracy,
+    get_learning_brief,
+    get_symbols_to_avoid,
+    get_weakness_report,
 )
-from relative_strength import get_relative_strength_intel, build_rs_prompt_section, rs_score_boost
-from catalyst_stack import build_catalyst_score, build_catalyst_prompt_section, catalyst_confidence_boost, minimum_catalyst_threshold
-from insider_flow import get_insider_intel, build_insider_prompt_section, insider_confidence_boost, InsiderIntel
 
 load_dotenv()
 
@@ -308,8 +313,20 @@ def compute_indicators(df: pd.DataFrame) -> dict:
         stoch_df = ta.stoch(high, low, close, k=14, d=3)
         stoch_k  = float(stoch_df["STOCHk_14_3_3"].iloc[-1]) if stoch_df is not None else None
 
-        # VWAP (intraday proxy using available bars)
+        # Session VWAP
         vwap = float((close * volume).cumsum().iloc[-1] / volume.cumsum().iloc[-1])
+
+        # Anchored VWAPs — weekly (last 5 bars) and monthly (last 21 bars)
+        def _anchored_vwap(n: int) -> float | None:
+            if len(close) < n:
+                return None
+            c_slice = close.iloc[-n:]
+            v_slice = volume.iloc[-n:]
+            denom   = float(v_slice.sum())
+            return float((c_slice * v_slice).sum() / denom) if denom > 0 else None
+
+        vwap_weekly  = _anchored_vwap(5)
+        vwap_monthly = _anchored_vwap(21)
 
         vol_sma   = float(volume.rolling(20).mean().iloc[-1])
         vol_ratio = float(volume.iloc[-1]) / vol_sma if vol_sma > 0 else 1.0
@@ -342,6 +359,12 @@ def compute_indicators(df: pd.DataFrame) -> dict:
             "bb_pct":            round(bb_pct * 100, 1) if bb_pct is not None else None,
             "vwap":              round(vwap, 4),
             "above_vwap":        price > vwap,
+            "vwap_weekly":       round(vwap_weekly,  4) if vwap_weekly  else None,
+            "vwap_monthly":      round(vwap_monthly, 4) if vwap_monthly else None,
+            "above_vwap_weekly": (price > vwap_weekly)  if vwap_weekly  else None,
+            "above_vwap_monthly":(price > vwap_monthly) if vwap_monthly else None,
+            "pct_from_vwap_weekly":  round((price - vwap_weekly)  / vwap_weekly  * 100, 2) if vwap_weekly  else None,
+            "pct_from_vwap_monthly": round((price - vwap_monthly) / vwap_monthly * 100, 2) if vwap_monthly else None,
             "ema9":              round(ema9, 4),
             "ema21":             round(ema21, 4),
             "ema50":             round(ema50, 4),
@@ -591,6 +614,11 @@ async def analyze_with_claude(
     setup_quality: float = 0.0,
     setup_confidence: float = 0.0,
     calendar_context: str = "",
+    learning_brief: str = "",
+    options_context: str = "",
+    short_context: str = "",
+    rs_context: str = "",
+    insider_context: str = "",
 ) -> dict:
     if claude is None:
         return {
@@ -612,6 +640,9 @@ async def analyze_with_claude(
     calendar_text = calendar_context or get_calendar_context()
 
     prompt = f"""You are the head trader at an elite quantitative hedge fund. You manage a high-conviction momentum portfolio. Your mandate: find asymmetric opportunities with exceptional risk/reward. You do not trade mediocre setups.
+
+## BOT SELF-KNOWLEDGE (WHAT I HAVE LEARNED FROM MY OWN TRADE HISTORY)
+{learning_brief or "No learning brief available yet — early learning phase."}
 
 ## MARKET CONTEXT
 Regime: {market_regime.get('regime', 'unknown').upper()}
@@ -647,6 +678,18 @@ Multi-Timeframe Alignment: {trend.upper()}
 
 ## NEWS & CATALYSTS
 {news_text}
+
+## RELATIVE STRENGTH
+{rs_context or "No RS data."}
+
+## OPTIONS FLOW (Institutional Options Activity)
+{options_context or "No options flow data."}
+
+## SHORT INTEREST / SQUEEZE POTENTIAL
+{short_context or "No short interest data."}
+
+## INSIDER FLOW (Form 4 Open-Market Purchases)
+{insider_context or "No insider data."}
 
 ## PORTFOLIO STATE
 Value: ${portfolio_value:,.0f} | Open: {open_positions}/{MAX_POSITIONS} | Risk/trade: {RISK_PER_TRADE*100}%
@@ -731,6 +774,8 @@ async def ai_risk_officer(
     rs_context: str = "",
     catalyst_context: str = "",
     insider_context: str = "",
+    options_context: str = "",
+    short_context: str = "",
 ) -> tuple[bool, str]:
     """
     Second independent Claude call. Adversarial — tries to find every reason
@@ -776,6 +821,12 @@ RSI: {ind_1d.get("rsi")} | EMA trend: {ind_1d.get("ema_trend")} | ATR%: {ind_1d.
 
 ## INSIDER FLOW (Form 4)
 {insider_context or "No insider data."}
+
+## OPTIONS FLOW
+{options_context or "No options flow data."}
+
+## SHORT INTEREST / SQUEEZE POTENTIAL
+{short_context or "No short interest data."}
 
 ## RECENT NEWS
 {chr(10).join(f"- {n.get('headline','')}" for n in news[:4]) or "None."}
@@ -1154,9 +1205,12 @@ async def scan_symbol(
     memory: dict | None = None,
     rs_intel: dict | None = None,
     insider_intel: dict | None = None,
+    options_flow_intel: dict | None = None,
+    short_intel: dict | None = None,
     earnings_catalyst: bool = False,
     calendar_context: str = "",
     scan_id: str = "",
+    learning_brief: str = "",
 ) -> Optional[dict]:
     try:
         # Event: scan started
@@ -1190,9 +1244,11 @@ async def scan_symbol(
         )
         advanced_regime = regime.get("advanced_regime") or regime.get("regime", "unknown")
         setup_quality   = score_setup_quality(setup_type, ind_1h, advanced_regime)
-        memory_context  = build_memory_prompt_section(memory or {}, symbol)
-        rs_context      = build_rs_prompt_section(rs_intel or {}, symbol)
-        insider_context = build_insider_prompt_section(insider_intel or {}, symbol)
+        memory_context      = build_memory_prompt_section(memory or {}, symbol)
+        rs_context          = build_rs_prompt_section(rs_intel or {}, symbol)
+        insider_context     = build_insider_prompt_section(insider_intel or {}, symbol)
+        options_context     = build_options_flow_prompt_section(options_flow_intel or {}, symbol)
+        short_context       = build_short_interest_prompt_section(short_intel or {}, symbol)
 
         # Catalyst stack — unified evidence score
         # Merge 13F institutional + Form 4 insider into one dict for catalyst scoring
@@ -1224,6 +1280,11 @@ async def scan_symbol(
             setup_quality=setup_quality,
             setup_confidence=setup_confidence,
             calendar_context=calendar_context,
+            learning_brief=learning_brief,
+            options_context=options_context,
+            short_context=short_context,
+            rs_context=rs_context,
+            insider_context=insider_context,
         )
 
         # Step 1: catalyst stack adjusts confidence
@@ -1263,6 +1324,16 @@ async def scan_symbol(
         signal["confidence"] = min(0.98, signal["confidence"] + ins_boost)
         signal["insider_boost"] = ins_boost
 
+        # Step 3.6: Options flow adjustment
+        opt_boost = options_flow_confidence_boost(options_flow_intel or {}, symbol, signal.get("signal", "hold"))
+        signal["confidence"] = min(0.98, signal["confidence"] + opt_boost)
+        signal["options_flow_boost"] = opt_boost
+
+        # Step 3.7: Short interest squeeze adjustment
+        si_boost = short_interest_confidence_boost(short_intel or {}, symbol, signal.get("signal", "hold"))
+        signal["confidence"] = min(0.98, signal["confidence"] + si_boost)
+        signal["short_interest_boost"] = si_boost
+
         # Step 4: AI Risk Officer veto check (only for actionable signals)
         signal["risk_officer_approved"] = True
         signal["risk_officer_note"]     = ""
@@ -1278,6 +1349,8 @@ async def scan_symbol(
                 rs_context=rs_context,
                 catalyst_context=catalyst_context,
                 insider_context=insider_context,
+                options_context=options_context,
+                short_context=short_context,
             )
             signal["risk_officer_approved"] = approved
             signal["risk_officer_note"]     = veto_reason
@@ -1367,6 +1440,16 @@ async def scan_symbol(
                 "insider_flow": (
                     insider_intel[symbol].as_dict()
                     if insider_intel and symbol in insider_intel
+                    else None
+                ),
+                "options_flow": (
+                    options_flow_intel[symbol].as_dict()
+                    if options_flow_intel and symbol in options_flow_intel
+                    else None
+                ),
+                "short_interest": (
+                    short_intel[symbol].as_dict()
+                    if short_intel and symbol in short_intel
                     else None
                 ),
                 "risk_officer": {
@@ -1513,12 +1596,48 @@ async def run_scan():
         except Exception as e:
             await log_bot(f"Insider flow error: {e}", "warning")
 
-        # Scan all symbols in batches
+        # Fetch options flow intel (cached 15 min)
+        options_flow_map: dict = {}
+        try:
+            options_flow_map = await get_options_flow_intel(WATCHLIST, ALPACA_HEADERS, ALPACA_DATA_URL)
+            bullish_flow = [s for s, v in options_flow_map.items() if v.flow_signal == "bullish" and v.conviction_score >= 0.4]
+            bearish_flow = [s for s, v in options_flow_map.items() if v.flow_signal == "bearish" and v.conviction_score >= 0.4]
+            if bullish_flow:
+                await log_bot(f"Unusual CALL flow: {', '.join(bullish_flow[:5])}", "info")
+            if bearish_flow:
+                await log_bot(f"Unusual PUT flow: {', '.join(bearish_flow[:5])}", "info")
+        except Exception as e:
+            await log_bot(f"Options flow error: {e}", "warning")
+
+        # Fetch short interest intel (cached 4h — Finviz)
+        short_intel_map: dict = {}
+        try:
+            short_intel_map = await get_short_interest_intel(WATCHLIST)
+            squeeze_plays = [s for s, v in short_intel_map.items() if v.squeeze_signal in ("extreme", "high")]
+            if squeeze_plays:
+                await log_bot(f"Squeeze candidates: {', '.join(squeeze_plays[:5])}", "info")
+        except Exception as e:
+            await log_bot(f"Short interest error: {e}", "warning")
+
+        # Build the learning brief from memory (injected into every Claude prompt)
+        learning_brief = get_learning_brief()
+
+        # Check the weakness report — skip symbols the bot is systematically bad at
+        symbols_to_avoid = get_symbols_to_avoid()
+        if symbols_to_avoid:
+            await log_bot(f"Memory AVOID list: {', '.join(symbols_to_avoid)}", "warning")
+
+        # Scan all symbols in batches (skip systematic losers)
+        scannable = [s for s in ordered_watchlist if s not in symbols_to_avoid]
+        if len(scannable) < len(ordered_watchlist):
+            skipped = set(ordered_watchlist) - set(scannable)
+            await log_bot(f"Skipping {len(skipped)} avoid-listed symbol(s): {', '.join(skipped)}", "warning")
+
         all_signals: list[dict] = []
-        for i in range(0, len(ordered_watchlist), BATCH_SIZE):
+        for i in range(0, len(scannable), BATCH_SIZE):
             if not bot_state["running"]:
                 return
-            batch   = ordered_watchlist[i : i + BATCH_SIZE]
+            batch   = scannable[i : i + BATCH_SIZE]
             results = await asyncio.gather(*[
                 scan_symbol(
                     sym,
@@ -1531,7 +1650,10 @@ async def run_scan():
                     calendar_context=calendar_context,
                     rs_intel=rs_intel,
                     insider_intel=insider_intel_map,
+                    options_flow_intel=options_flow_map,
+                    short_intel=short_intel_map,
                     scan_id=scan_id,
+                    learning_brief=learning_brief,
                 )
                 for sym in batch
             ])
