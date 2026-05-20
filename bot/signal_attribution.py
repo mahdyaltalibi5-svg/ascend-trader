@@ -85,18 +85,22 @@ def build_attribution_row(
     # These were written by scan_symbol() as signal["rs_boost"] etc.
     # They live at the top of the indicators JSONB in some builds or in
     # the scan_events payload.  We fall back to 0.0 gracefully.
-    rs_boost      = float(signal_record.get("rs_boost", 0.0) or 0.0)
-    insider_boost = float(signal_record.get("insider_boost", 0.0) or 0.0)
-    opts_boost    = float(signal_record.get("options_flow_boost", 0.0) or 0.0)
-    si_boost      = float(signal_record.get("short_interest_boost", 0.0) or 0.0)
-    mem_boost     = float(memory_adj.get("calibration_delta", 0.0) or 0.0)
+    rs_boost      = float(indicators.get("rs_boost", signal_record.get("rs_boost", 0.0)) or 0.0)
+    insider_boost = float(indicators.get("insider_boost", signal_record.get("insider_boost", 0.0)) or 0.0)
+    opts_boost    = float(indicators.get("options_flow_boost", signal_record.get("options_flow_boost", 0.0)) or 0.0)
+    si_boost      = float(indicators.get("short_interest_boost", signal_record.get("short_interest_boost", 0.0)) or 0.0)
+    mem_boost     = float(
+        memory_adj.get("boost_amount", memory_adj.get("calibration_delta", 0.0)) or 0.0
+    )
     cat_score     = float(catalyst.get("total_score", 0.0) or 0.0)
 
-    conf_raw   = float(signal_record.get("confidence_raw", signal_record.get("strength", 0.0)) or 0.0)
+    conf_raw   = float(indicators.get("confidence_raw", signal_record.get("strength", 0.0)) or 0.0)
     conf_final = float(signal_record.get("confidence", 0.0) or 0.0)
 
     outcome_score = float(outcome_record.get("outcome_score", 0.0) or 0.0)
-    r_multiple    = float(outcome_record.get("return_1d_pct", 0.0) or 0.0)
+    r_multiple    = float(
+        outcome_record.get("r_multiple", outcome_record.get("return_1d_pct", 0.0)) or 0.0
+    )
     hit_stop      = bool(outcome_record.get("hit_stop", False))
     hit_target    = bool(outcome_record.get("hit_take_profit", False))
     won           = hit_target or (outcome_score > 0 and not hit_stop)
@@ -112,8 +116,12 @@ def build_attribution_row(
     return {
         "signal_id":             signal_id,
         "symbol":                symbol,
-        "setup_type":            signal_record.get("setup_type"),
-        "regime":                (signal_record.get("market_regime") or {}).get("advanced_regime"),
+        "setup_type":            setup.get("type") or signal_record.get("setup_type"),
+        "regime":                (
+            indicators.get("regime")
+            or (signal_record.get("market_regime") or {}).get("advanced_regime")
+            or (signal_record.get("market_regime") or {}).get("regime")
+        ),
         "signal_side":           side,
         "confidence_raw":        round(conf_raw, 4),
         "confidence_final":      round(conf_final, 4),

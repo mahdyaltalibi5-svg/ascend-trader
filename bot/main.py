@@ -10,6 +10,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -150,6 +151,7 @@ monitor_task: Optional[asyncio.Task] = None
 # Track trade IDs that have already had a partial-profit close so we don't
 # fire the partial-take twice on the same position.
 _partial_taken: set[str] = set()
+EASTERN_TZ = ZoneInfo("America/New_York")
 
 
 # ---------------------------------------------------------------------------
@@ -476,7 +478,11 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
     res = (
         db.table("signals")
-        .select("id,symbol,signal,entry_price,stop_loss,take_profit,created_at,outcome_checked_at")
+        .select(
+            "id,symbol,signal,strategy,strength,confidence,criteria_met,"
+            "entry_price,stop_loss,take_profit,created_at,outcome_checked_at,"
+            "market_regime,indicators"
+        )
         .in_("signal", ["buy", "sell"])
         .lte("created_at", cutoff)
         .order("created_at", desc=False)
@@ -530,6 +536,16 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
             ret_3d = _directional_return(side, entry, price_3d)
             score = _outcome_score([ret_1h, ret_1d, ret_3d], hit_stop, hit_target)
             checked_at = datetime.now(timezone.utc).isoformat()
+            stop = float(sig.get("stop_loss") or entry)
+            risk_per_share = abs(entry - stop)
+            if price_1d is not None and risk_per_share > 0:
+                r_multiple = (
+                    (price_1d - entry) / risk_per_share
+                    if side == "buy"
+                    else (entry - price_1d) / risk_per_share
+                )
+            else:
+                r_multiple = 0.0
 
             db.table("signal_outcomes").upsert(
                 {
@@ -559,7 +575,7 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
             try:
                 outcome_row = {
                     "outcome_score": score,
-                    "r_multiple": round(ret_1d, 3) if ret_1d is not None else 0.0,
+                    "r_multiple": round(r_multiple, 3),
                     "hit_stop": hit_stop,
                     "hit_take_profit": hit_target,
                 }
@@ -1130,17 +1146,13 @@ async def execute_signal(signal: dict, portfolio_value: float, open_positions_li
 # Position monitor — trailing stops + P&L sync
 # ---------------------------------------------------------------------------
 def _is_eod_exit_window() -> bool:
-    """Return True if it's within the last 15 minutes of the NYSE session (after 3:45 PM ET).
-    Uses UTC: 3:45 PM EDT = 19:45 UTC; 3:45 PM EST = 20:45 UTC.
-    We check both windows to handle DST transitions safely.
-    """
-    now = datetime.now(timezone.utc)
-    # EDT window (March–Nov): market close = 20:00 UTC, gate = 19:45 UTC
-    # EST window (Nov–Mar):  market close = 21:00 UTC, gate = 20:45 UTC
-    h, m = now.hour, now.minute
-    edt_gate = (h == 19 and m >= 45) or h == 20
-    est_gate = (h == 20 and m >= 45) or h == 21
-    return edt_gate or est_gate
+    """Return True inside the last 15 minutes of the regular NYSE session."""
+    now_et = datetime.now(timezone.utc).astimezone(EASTERN_TZ)
+    if now_et.weekday() >= 5:
+        return False
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    eod_gate = market_close - timedelta(minutes=15)
+    return eod_gate <= now_et < market_close
 
 
 async def monitor_positions():
@@ -1224,8 +1236,10 @@ async def monitor_positions():
             # ── Partial profit take at 1.5R (50% of position) ───────────────
             if rr >= 1.5 and trade_id not in _partial_taken and qty >= 2:
                 partial_qty = qty // 2
+                remaining_qty = qty - partial_qty
                 close_side  = "sell" if side == "long" else "buy"
                 try:
+                    await _cancel_symbol_orders(symbol, open_orders)
                     await alpaca_post("/v2/orders", {
                         "symbol":        symbol,
                         "qty":           str(partial_qty),
@@ -1239,6 +1253,8 @@ async def monitor_positions():
                         f"(${current:.2f}, gain=${gain*partial_qty:.0f})",
                         "info",
                     )
+                    qty = remaining_qty
+                    open_orders = []
                 except Exception as exc:
                     await log_bot(f"[{symbol}] Partial close failed: {exc}", "error")
 
@@ -1249,6 +1265,8 @@ async def monitor_positions():
                     new_stop = entry + initial_risk * 1.5   # lock in 1.5R
                 elif rr >= 2.0:
                     new_stop = entry + initial_risk          # lock in 1R
+                elif rr >= 1.5:
+                    new_stop = entry + 0.02                  # protect runner after partial
                 elif rr >= 1.0:
                     new_stop = entry + 0.02                  # break-even
 
@@ -1261,6 +1279,8 @@ async def monitor_positions():
                     new_stop = entry - initial_risk * 1.5
                 elif rr >= 2.0:
                     new_stop = entry - initial_risk
+                elif rr >= 1.5:
+                    new_stop = entry - 0.02
                 elif rr >= 1.0:
                     new_stop = entry - 0.02
 
@@ -1279,9 +1299,22 @@ async def monitor_positions():
 async def _close_full_position(symbol: str) -> None:
     """Market-close an entire open position via Alpaca."""
     try:
+        open_orders = await alpaca_get("/v2/orders?status=open&limit=200")
+        await _cancel_symbol_orders(symbol, open_orders if isinstance(open_orders, list) else [])
         await alpaca_delete(f"/v2/positions/{symbol}")
     except Exception as exc:
         await log_bot(f"[{symbol}] Full position close failed: {exc}", "error")
+
+
+async def _cancel_symbol_orders(symbol: str, open_orders: list) -> None:
+    """Cancel open orders for a symbol before manual partial/full exits."""
+    for order in open_orders:
+        if order.get("symbol") != symbol:
+            continue
+        try:
+            await alpaca_delete(f"/v2/orders/{order['id']}")
+        except Exception:
+            pass
 
 
 async def _replace_stop(
@@ -1658,6 +1691,12 @@ async def scan_symbol(
                 "1h":    ind_1h,
                 "1d":    ind_1d,
                 "trend": mtf_trend(ind_5m, ind_1h, ind_1d),
+                "confidence_raw": raw_confidence,
+                "confidence_after_catalyst": catalyst_conf,
+                "rs_boost": signal.get("rs_boost"),
+                "insider_boost": signal.get("insider_boost"),
+                "options_flow_boost": signal.get("options_flow_boost"),
+                "short_interest_boost": signal.get("short_interest_boost"),
                 "setup": {
                     "type": setup_type,
                     "classification_confidence": setup_confidence,
