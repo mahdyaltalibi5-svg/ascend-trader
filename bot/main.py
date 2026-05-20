@@ -77,6 +77,8 @@ MAX_DAILY_LOSS_PCT  = 0.04    # circuit breaker: stop at -4% daily
 SCAN_INTERVAL_SECS  = 300     # full market scan every 5 minutes
 MONITOR_INTERVAL    = 90      # position check every 90 seconds
 BATCH_SIZE          = 5       # symbols per concurrent batch
+EXIT_REVIEW_MIN_INTERVAL = 600  # avoid paying for full AI exit reviews every monitor tick
+EXIT_CONFIDENCE_THRESHOLD = 0.78
 
 # ---------------------------------------------------------------------------
 # Clients
@@ -152,6 +154,7 @@ monitor_task: Optional[asyncio.Task] = None
 # fire the partial-take twice on the same position.
 _partial_taken: set[str] = set()
 EASTERN_TZ = ZoneInfo("America/New_York")
+_exit_reviewed_at: dict[str, datetime] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1155,6 +1158,150 @@ def _is_eod_exit_window() -> bool:
     return eod_gate <= now_et < market_close
 
 
+def _exit_breakdown_flags(
+    side: str,
+    rr: float,
+    ind_5m: dict,
+    ind_1h: dict,
+    market_regime: dict,
+) -> list[str]:
+    """Fast deterministic thesis-damage screen before paying for a Claude exit review."""
+    flags: list[str] = []
+    advanced_regime = market_regime.get("advanced_regime") or market_regime.get("regime")
+
+    if rr <= -0.35:
+        flags.append(f"position down {rr:.2f}R")
+    if advanced_regime in ("high_vol_panic", "risk_off") and side == "long":
+        flags.append(f"{advanced_regime} hostile to longs")
+    if advanced_regime in ("risk_on", "trend_day") and side == "short":
+        flags.append(f"{advanced_regime} hostile to shorts")
+
+    if side == "long":
+        if ind_5m.get("above_vwap") is False:
+            flags.append("5m below VWAP")
+        if ind_5m.get("above_ema21") is False:
+            flags.append("5m below EMA21")
+        if ind_1h.get("ema_trend") == "bearish":
+            flags.append("1h trend bearish")
+        if (ind_5m.get("macd_histogram") or 0) < 0 and (ind_5m.get("volume_ratio") or 1) >= 1.5:
+            flags.append("bearish MACD on elevated volume")
+    else:
+        if ind_5m.get("above_vwap") is True:
+            flags.append("5m above VWAP")
+        if ind_5m.get("above_ema21") is True:
+            flags.append("5m above EMA21")
+        if ind_1h.get("ema_trend") == "bullish":
+            flags.append("1h trend bullish")
+        if (ind_5m.get("macd_histogram") or 0) > 0 and (ind_5m.get("volume_ratio") or 1) >= 1.5:
+            flags.append("bullish MACD on elevated volume")
+
+    return flags
+
+
+def _should_run_exit_review(trade_id: str, flags: list[str]) -> bool:
+    if len(flags) >= 2:
+        return True
+    last = _exit_reviewed_at.get(trade_id)
+    if last is None:
+        return True
+    return datetime.now(timezone.utc) - last >= timedelta(seconds=EXIT_REVIEW_MIN_INTERVAL)
+
+
+async def ai_exit_officer(
+    *,
+    symbol: str,
+    side: str,
+    entry: float,
+    current: float,
+    stop_loss: float,
+    target: float | None,
+    rr: float,
+    hours_held: float,
+    ind_5m: dict,
+    ind_1h: dict,
+    market_regime: dict,
+    news: list[dict],
+    breakdown_flags: list[str],
+    trader_reasoning: str = "",
+) -> dict:
+    """Independent AI exit review for open positions."""
+    if claude is None:
+        return {"action": "hold", "confidence": 0.0, "reasoning": "Claude not configured."}
+
+    news_text = "\n".join(f"- {n.get('headline') or n.get('title') or ''}" for n in news[:5]) or "No recent news."
+    prompt = f"""You are the exit officer for an AI trading desk. Your job is to protect capital and decide whether an OPEN position thesis is still valid.
+
+Return ONLY valid JSON. No markdown.
+
+## OPEN POSITION
+Symbol: {symbol}
+Side: {side.upper()}
+Entry: {entry}
+Current: {current}
+Stop: {stop_loss}
+Target: {target}
+Current R multiple: {rr:.2f}R
+Hours held: {hours_held:.1f}
+Original thesis: {trader_reasoning or "Not available."}
+
+## THESIS DAMAGE FLAGS
+{chr(10).join(f"- {flag}" for flag in breakdown_flags) or "- No major deterministic damage flags."}
+
+## MARKET REGIME
+Regime: {market_regime.get("advanced_regime", market_regime.get("regime", "unknown"))}
+Note: {market_regime.get("regime_note", "")}
+SPY trend={market_regime.get("spy_trend")} RSI={market_regime.get("spy_rsi")} change={market_regime.get("spy_change")}%
+QQQ trend={market_regime.get("qqq_trend")} RSI={market_regime.get("qqq_rsi")}
+
+## 5M POSITION HEALTH
+{json.dumps(ind_5m, indent=2)}
+
+## 1H POSITION HEALTH
+{json.dumps(ind_1h, indent=2)}
+
+## RECENT NEWS
+{news_text}
+
+## DECISION RULES
+- EXIT if the original thesis is broken, market regime flipped hard against the position, or price/volume confirms distribution against the trade.
+- TIGHTEN_STOP if thesis is damaged but not fully broken.
+- HOLD if the trade is behaving normally or noise is not enough to override the plan.
+- Do not exit purely because the position is slightly red. Require evidence.
+
+Return JSON:
+{{
+  "action": "hold" | "tighten_stop" | "exit",
+  "confidence": 0.0-1.0,
+  "proposed_stop": number | null,
+  "reasoning": "1-3 sentences explaining the exit decision",
+  "thesis_broken": true|false,
+  "key_evidence": ["evidence1", "evidence2"]
+}}"""
+
+    for attempt in range(2):
+        try:
+            response = claude.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=700,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.content[0].text.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            decision = json.loads(text.strip())
+            if decision.get("action") not in ("hold", "tighten_stop", "exit"):
+                decision["action"] = "hold"
+            return decision
+        except Exception:
+            if attempt == 1:
+                return {"action": "hold", "confidence": 0.0, "reasoning": "Exit review parse/API failed."}
+            await asyncio.sleep(1)
+
+    return {"action": "hold", "confidence": 0.0, "reasoning": "Exit review unavailable."}
+
+
 async def monitor_positions():
     """Run every MONITOR_INTERVAL seconds. Active position management:
     trailing stops, partial profit takes, time-based exits."""
@@ -1168,6 +1315,7 @@ async def monitor_positions():
             open_orders = []
 
         eod = _is_eod_exit_window()
+        market_regime = await get_market_regime()
 
         for pos in positions_resp:
             symbol  = pos["symbol"]
@@ -1181,7 +1329,7 @@ async def monitor_positions():
             db = require_supabase()
             res = (
                 db.table("trades")
-                .select("stop_loss, exit_price, id, entry_at, created_at")
+                .select("stop_loss, exit_price, id, entry_at, created_at, ai_reasoning")
                 .eq("symbol", symbol)
                 .eq("status", "open")
                 .order("created_at", desc=True)
@@ -1196,6 +1344,7 @@ async def monitor_positions():
             orig_stop   = trade.get("stop_loss")
             orig_target = trade.get("exit_price")
             entry_at_str = trade.get("entry_at") or trade.get("created_at", "")
+            trader_reasoning = trade.get("ai_reasoning") or ""
 
             if not orig_stop:
                 continue
@@ -1216,13 +1365,25 @@ async def monitor_positions():
             # EOD forced close — don't hold overnight without a deliberate swing setup
             if eod and hours_held < 24:
                 await log_bot(f"[{symbol}] EOD forced close after {hours_held:.1f}h held", "warning")
-                await _close_full_position(symbol)
+                await _close_full_position(
+                    symbol,
+                    trade_id=trade_id,
+                    exit_price=current,
+                    pnl=unreal,
+                    reason="eod_forced_close",
+                )
                 continue
 
             # Max hold: 72 hours (3 calendar days) regardless of outcome
             if hours_held > 72:
                 await log_bot(f"[{symbol}] Max hold time (72h) reached — closing", "warning")
-                await _close_full_position(symbol)
+                await _close_full_position(
+                    symbol,
+                    trade_id=trade_id,
+                    exit_price=current,
+                    pnl=unreal,
+                    reason="max_hold_time",
+                )
                 continue
 
             # ── R-multiple tracking ──────────────────────────────────────────
@@ -1232,6 +1393,88 @@ async def monitor_positions():
             else:
                 gain = entry - current
                 rr   = gain / initial_risk
+
+            bars_5m, bars_1h, news = await asyncio.gather(
+                fetch_bars(symbol, "5Min", 100),
+                fetch_bars(symbol, "1Hour", 100),
+                fetch_news(symbol),
+            )
+            ind_5m = compute_indicators(bars_5m)
+            ind_1h = compute_indicators(bars_1h)
+            breakdown_flags = _exit_breakdown_flags(side, rr, ind_5m, ind_1h, market_regime)
+
+            if _should_run_exit_review(trade_id, breakdown_flags):
+                _exit_reviewed_at[trade_id] = datetime.now(timezone.utc)
+                exit_decision = await ai_exit_officer(
+                    symbol=symbol,
+                    side=side,
+                    entry=entry,
+                    current=current,
+                    stop_loss=float(orig_stop),
+                    target=float(orig_target) if orig_target else None,
+                    rr=rr,
+                    hours_held=hours_held,
+                    ind_5m=ind_5m,
+                    ind_1h=ind_1h,
+                    market_regime=market_regime,
+                    news=news,
+                    breakdown_flags=breakdown_flags,
+                    trader_reasoning=trader_reasoning,
+                )
+                action = str(exit_decision.get("action", "hold"))
+                exit_confidence = float(exit_decision.get("confidence", 0) or 0)
+                proposed_stop = exit_decision.get("proposed_stop")
+                await write_scan_event(
+                    f"monitor_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
+                    symbol,
+                    "exit_review",
+                    action=action,
+                    confidence=exit_confidence,
+                    risk_status="exit_officer",
+                    rejection_reason=None if action != "hold" else exit_decision.get("reasoning"),
+                    payload={
+                        "rr": round(rr, 3),
+                        "hours_held": round(hours_held, 2),
+                        "breakdown_flags": breakdown_flags,
+                        "exit_decision": exit_decision,
+                        "market_regime": market_regime,
+                        "position": {
+                            "side": side,
+                            "entry": entry,
+                            "current": current,
+                            "stop_loss": orig_stop,
+                            "target": orig_target,
+                            "unrealized_pnl": unreal,
+                        },
+                    },
+                )
+
+                if action == "exit" and exit_confidence >= EXIT_CONFIDENCE_THRESHOLD:
+                    await log_bot(
+                        f"[{symbol}] AI exit officer closed position | conf={exit_confidence:.0%} | "
+                        f"rr={rr:.2f} | {exit_decision.get('reasoning', '')}",
+                        "warning",
+                    )
+                    await _close_full_position(
+                        symbol,
+                        trade_id=trade_id,
+                        exit_price=current,
+                        pnl=unreal,
+                        reason="ai_exit_officer",
+                    )
+                    continue
+
+                if action == "tighten_stop" and proposed_stop is not None and exit_confidence >= 0.65:
+                    try:
+                        proposed_stop_f = float(proposed_stop)
+                        if side == "long" and proposed_stop_f > float(orig_stop) and proposed_stop_f < current:
+                            await _replace_stop(symbol, qty, "sell", proposed_stop_f, open_orders, float(orig_stop))
+                            orig_stop = proposed_stop_f
+                        elif side == "short" and proposed_stop_f < float(orig_stop) and proposed_stop_f > current:
+                            await _replace_stop(symbol, qty, "buy", proposed_stop_f, open_orders, float(orig_stop))
+                            orig_stop = proposed_stop_f
+                    except Exception as exc:
+                        await log_bot(f"[{symbol}] AI tighten stop failed: {exc}", "error")
 
             # ── Partial profit take at 1.5R (50% of position) ───────────────
             if rr >= 1.5 and trade_id not in _partial_taken and qty >= 2:
@@ -1296,12 +1539,34 @@ async def monitor_positions():
         await log_bot(f"Position monitor error: {e}", "error")
 
 
-async def _close_full_position(symbol: str) -> None:
+async def _close_full_position(
+    symbol: str,
+    *,
+    trade_id: str | None = None,
+    exit_price: float | None = None,
+    pnl: float | None = None,
+    reason: str = "manual_exit",
+) -> None:
     """Market-close an entire open position via Alpaca."""
     try:
         open_orders = await alpaca_get("/v2/orders?status=open&limit=200")
         await _cancel_symbol_orders(symbol, open_orders if isinstance(open_orders, list) else [])
         await alpaca_delete(f"/v2/positions/{symbol}")
+        update = {
+            "status": "closed",
+            "exit_at": datetime.now(timezone.utc).isoformat(),
+            "ai_reasoning": f"{reason}: position closed by bot monitor",
+        }
+        if exit_price is not None:
+            update["exit_price"] = round(exit_price, 4)
+        if pnl is not None:
+            update["pnl"] = round(pnl, 2)
+        query = require_supabase().table("trades").update(update)
+        if trade_id:
+            query = query.eq("id", trade_id)
+        else:
+            query = query.eq("symbol", symbol).eq("status", "open")
+        query.execute()
     except Exception as exc:
         await log_bot(f"[{symbol}] Full position close failed: {exc}", "error")
 
