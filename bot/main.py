@@ -21,6 +21,8 @@ from supabase import create_client, Client
 import anthropic
 from dotenv import load_dotenv
 from backtest import fetch_historical_bars, parse_config, run_research_backtest
+from risk_engine import validate_trade, kelly_fraction
+from earnings import get_pre_earnings_opportunities
 
 load_dotenv()
 
@@ -109,6 +111,7 @@ bot_state = {
     "day_pnl":                 0.0,
     "started_at":              None,
     "scan_count":              0,
+    "options_mode":            False,
 }
 
 scan_task:    Optional[asyncio.Task] = None
@@ -602,7 +605,7 @@ async def check_circuit_breaker(account: dict) -> bool:
 # ---------------------------------------------------------------------------
 # Trade execution
 # ---------------------------------------------------------------------------
-async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]:
+async def execute_signal(signal: dict, portfolio_value: float, open_positions_list: Optional[list] = None) -> Optional[dict]:
     if signal.get("signal") == "hold":
         return None
     if signal.get("confidence", 0) < MIN_CONFIDENCE:
@@ -612,11 +615,49 @@ async def execute_signal(signal: dict, portfolio_value: float) -> Optional[dict]
 
     symbol = signal["symbol"]
     side   = signal["signal"]
-    entry  = signal["entry_price"]
-    stop   = signal["stop_loss"]
-    target = signal["take_profit"]
+    entry  = signal.get("entry_price")
+    stop   = signal.get("stop_loss")
+    target = signal.get("take_profit")
+
+    if not entry or not stop or not target:
+        return None
+
+    # --- Risk engine validation ---
+    positions_for_risk = open_positions_list or []
+    win_rate_frac = bot_state["win_rate"] / 100.0 if bot_state["win_rate"] > 0 else 0.5
+
+    approved, rejection_reasons = validate_trade(
+        symbol=symbol,
+        side="long" if side == "buy" else "short",
+        entry=entry,
+        stop=stop,
+        target=target,
+        portfolio_value=portfolio_value,
+        open_positions=positions_for_risk,
+        win_rate=win_rate_frac,
+    )
+
+    if not approved:
+        reasons_str = " | ".join(rejection_reasons)
+        await log_bot(
+            f"[{symbol}] REJECTED by risk engine: {reasons_str}",
+            "warning",
+        )
+        return None
+
+    # --- Kelly-adjusted position sizing ---
+    kelly_frac = kelly_fraction(
+        win_rate=win_rate_frac,
+        avg_win_r=2.5,
+        avg_loss_r=1.0,
+    )
+    kelly_risk_dollars = portfolio_value * kelly_frac
 
     qty = calc_qty(portfolio_value, entry, stop)
+    # Scale qty by Kelly fraction relative to default RISK_PER_TRADE
+    kelly_scale = kelly_frac / RISK_PER_TRADE
+    qty = max(1, int(qty * kelly_scale))
+
     if qty <= 0:
         return None
 
@@ -936,7 +977,8 @@ async def run_scan():
 
         portfolio_value = float(account.get("portfolio_value", 100_000))
         positions_resp  = await alpaca_get("/v2/positions")
-        open_positions  = len(positions_resp) if isinstance(positions_resp, list) else 0
+        open_positions_list = positions_resp if isinstance(positions_resp, list) else []
+        open_positions  = len(open_positions_list)
 
         await log_bot(
             f"Regime: {regime.get('regime','?').upper()} | "
@@ -944,20 +986,55 @@ async def run_scan():
             "info",
         )
 
+        # --- Earnings scan: find symbols with earnings in next 1–5 days ---
+        earnings_symbols: set[str] = set()
+        try:
+            pre_earnings = await get_pre_earnings_opportunities(
+                symbols=WATCHLIST,
+                alpaca_headers=ALPACA_HEADERS,
+                min_days=1,
+                max_days=5,
+            )
+            if pre_earnings:
+                for opp in pre_earnings:
+                    sym = opp["symbol"]
+                    earnings_symbols.add(sym)
+                    await log_bot(
+                        f"[EARNINGS] {sym} reports in {opp['days_until']} day(s) "
+                        f"({opp['earnings_date']} via {opp['source']}) — prioritising",
+                        "info",
+                    )
+        except Exception as exc:
+            await log_bot(f"Earnings scan error: {exc}", "warning")
+
+        # Build scan order: earnings symbols first, then the rest
+        earnings_first   = [s for s in WATCHLIST if s in earnings_symbols]
+        non_earnings     = [s for s in WATCHLIST if s not in earnings_symbols]
+        ordered_watchlist = earnings_first + non_earnings
+
         # Scan all symbols in batches
         all_signals: list[dict] = []
-        for i in range(0, len(WATCHLIST), BATCH_SIZE):
+        for i in range(0, len(ordered_watchlist), BATCH_SIZE):
             if not bot_state["running"]:
                 return
-            batch   = WATCHLIST[i : i + BATCH_SIZE]
+            batch   = ordered_watchlist[i : i + BATCH_SIZE]
             results = await asyncio.gather(*[
                 scan_symbol(sym, regime, portfolio_value, open_positions)
                 for sym in batch
             ])
-            all_signals.extend(s for s in results if s is not None)
+            for s in results:
+                if s is not None:
+                    if s.get("symbol") in earnings_symbols:
+                        s["earnings_catalyst"] = True
+                    all_signals.append(s)
             await asyncio.sleep(1.5)
 
         # Filter and rank by composite score
+        # Earnings-catalyst signals get a small score boost to keep them near front
+        def _sort_key(sig: dict) -> float:
+            base = sig.get("_score", 0)
+            return base + (0.05 if sig.get("earnings_catalyst") else 0.0)
+
         actionable = sorted(
             [
                 s for s in all_signals
@@ -965,14 +1042,15 @@ async def run_scan():
                 and s.get("confidence", 0) >= MIN_CONFIDENCE
                 and s.get("risk_reward_ratio", 0) >= MIN_RR
             ],
-            key=lambda x: x.get("_score", 0),
+            key=_sort_key,
             reverse=True,
         )
 
         slots = MAX_POSITIONS - open_positions
         await log_bot(
             f"{len(actionable)} high-conviction signals | {slots} slots | "
-            f"circuit_breaker={bot_state['circuit_breaker_active']}",
+            f"circuit_breaker={bot_state['circuit_breaker_active']} | "
+            f"earnings_catalysts={len(earnings_symbols)}",
             "info",
         )
 
@@ -981,10 +1059,13 @@ async def run_scan():
                 if not bot_state["running"]:
                     break
                 try:
-                    order = await execute_signal(signal, portfolio_value)
+                    order = await execute_signal(
+                        signal, portfolio_value, open_positions_list
+                    )
                     if order:
+                        earnings_tag = " [EARNINGS]" if signal.get("earnings_catalyst") else ""
                         await log_bot(
-                            f"✅ TRADE: {signal['signal'].upper()} {signal['symbol']} | "
+                            f"✅ TRADE{earnings_tag}: {signal['signal'].upper()} {signal['symbol']} | "
                             f"conf={signal['confidence']:.0%} | "
                             f"R/R={signal.get('risk_reward_ratio',0):.1f} | "
                             f"entry=${signal['entry_price']} | "
@@ -1206,3 +1287,32 @@ async def cancel_order(order_id: str):
     if not success:
         raise HTTPException(400, "Cancel failed")
     return {"cancelled": order_id}
+
+
+@app.post("/options/enable")
+async def enable_options_mode():
+    """
+    Enable options execution mode. When active, high-confidence signals will
+    route to options orders (via options.py) in addition to equity scans.
+    Requires Alpaca options permissions on the connected account.
+    """
+    bot_state["options_mode"] = True
+    await log_bot("Options mode ENABLED — high-confidence signals will use options execution", "info")
+    return {"options_mode": True, "status": "enabled"}
+
+
+@app.post("/options/disable")
+async def disable_options_mode():
+    """Disable options execution mode; bot returns to equity-only orders."""
+    bot_state["options_mode"] = False
+    await log_bot("Options mode DISABLED — reverting to equity-only execution", "info")
+    return {"options_mode": False, "status": "disabled"}
+
+
+@app.get("/options/status")
+async def options_status():
+    """Return current options mode state."""
+    return {
+        "options_mode": bot_state["options_mode"],
+        "note": "Enable with POST /options/enable once Alpaca options permissions are confirmed.",
+    }
