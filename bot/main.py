@@ -32,6 +32,9 @@ from signal_memory import (
     build_memory_prompt_section,
     get_setup_historical_accuracy,
 )
+from relative_strength import get_relative_strength_intel, build_rs_prompt_section, rs_score_boost
+from catalyst_stack import build_catalyst_score, build_catalyst_prompt_section, catalyst_confidence_boost, minimum_catalyst_threshold
+from insider_flow import get_insider_intel, build_insider_prompt_section, insider_confidence_boost, InsiderIntel
 
 load_dotenv()
 
@@ -125,10 +128,55 @@ bot_state = {
     "no_trade_reason":         None,
     "advanced_regime":         "unknown",
     "regime_confidence":       0.0,
+    # no_trade_mode: "strict" (block execution), "balanced" (warn but allow),
+    # "monitor_only" (never execute, always observe)
+    "no_trade_mode":           "strict",
 }
 
 scan_task:    Optional[asyncio.Task] = None
 monitor_task: Optional[asyncio.Task] = None
+
+
+# ---------------------------------------------------------------------------
+# Scan event writer
+# ---------------------------------------------------------------------------
+
+async def write_scan_event(
+    scan_id: str,
+    symbol: str,
+    stage: str,
+    *,
+    action: str | None = None,
+    confidence: float | None = None,
+    composite_score: float | None = None,
+    setup_type: str | None = None,
+    setup_quality: float | None = None,
+    catalyst_score: float | None = None,
+    rs_signal: str | None = None,
+    risk_status: str | None = None,
+    rejection_reason: str | None = None,
+    payload: dict | None = None,
+) -> None:
+    """Write a structured scan event row to Supabase. Non-blocking — errors are logged only."""
+    try:
+        db = require_supabase()
+        db.table("scan_events").insert({
+            "scan_id":          scan_id,
+            "symbol":           symbol,
+            "stage":            stage,
+            "action":           action,
+            "confidence":       confidence,
+            "composite_score":  composite_score,
+            "setup_type":       setup_type,
+            "setup_quality":    setup_quality,
+            "catalyst_score":   catalyst_score,
+            "rs_signal":        rs_signal,
+            "risk_status":      risk_status,
+            "rejection_reason": rejection_reason,
+            "payload":          payload or {},
+        }).execute()
+    except Exception as exc:
+        pass  # never crash a scan over a telemetry write
 
 # ---------------------------------------------------------------------------
 # Alpaca helpers
@@ -156,6 +204,44 @@ async def alpaca_delete(path: str) -> bool:
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.delete(f"{ALPACA_TRADE_URL}{path}", headers=ALPACA_HEADERS)
         return r.status_code in (200, 204)
+
+
+async def check_spread_slippage(symbol: str, entry_price: float, stop_loss: float) -> tuple[bool, str]:
+    """
+    Fetch latest quote and reject if spread is too wide or estimated slippage
+    breaks the trade's R/R.
+
+    Returns (approved: bool, reason: str).
+    """
+    try:
+        data = await alpaca_get(f"/v2/stocks/{symbol}/quotes/latest", base=ALPACA_DATA_URL)
+        quote = data.get("quote", data)
+        bid = float(quote.get("bp", 0) or 0)
+        ask = float(quote.get("ap", 0) or 0)
+
+        if bid <= 0 or ask <= 0:
+            return True, ""  # no quote data — allow through
+
+        mid   = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid if mid > 0 else 0
+
+        # Reject if spread > 0.5% of mid price — too wide to trade cleanly
+        if spread_pct > 0.005:
+            return False, f"Spread too wide: {spread_pct*100:.2f}% ({bid:.2f}/{ask:.2f})"
+
+        # Estimate slippage: assume worst-case fill at ask (long) or bid (short)
+        # If slippage eats > 20% of the R, kill the trade
+        risk_per_share = abs(entry_price - stop_loss)
+        slippage       = ask - mid  # cost of crossing the spread
+        if risk_per_share > 0 and slippage / risk_per_share > 0.20:
+            return False, (
+                f"Slippage risk too high: spread costs {slippage:.3f} "
+                f"vs risk {risk_per_share:.3f} per share ({slippage/risk_per_share*100:.0f}% of R)"
+            )
+
+        return True, ""
+    except Exception as exc:
+        return True, f"Spread check skipped: {exc}"
 
 # ---------------------------------------------------------------------------
 # Market data
@@ -633,6 +719,110 @@ Return ONLY valid JSON, no markdown fences:
 
     return {"signal": "hold", "confidence": 0}
 
+
+async def ai_risk_officer(
+    symbol: str,
+    trader_signal: dict,
+    ind_1h: dict,
+    ind_1d: dict,
+    news: list[dict],
+    market_regime: dict,
+    intel: dict | None = None,
+    rs_context: str = "",
+    catalyst_context: str = "",
+    insider_context: str = "",
+) -> tuple[bool, str]:
+    """
+    Second independent Claude call. Adversarial — tries to find every reason
+    NOT to take this trade. Returns (approved, rejection_reason).
+    Only called when trader signal is buy/sell with confidence >= MIN_CONFIDENCE.
+    """
+    if claude is None:
+        return True, ""
+
+    side   = trader_signal.get("signal", "hold")
+    entry  = trader_signal.get("entry_price", 0)
+    stop   = trader_signal.get("stop_loss", 0)
+    target = trader_signal.get("take_profit", 0)
+    conf   = trader_signal.get("confidence", 0)
+    rr     = trader_signal.get("risk_reward_ratio", 0)
+
+    prompt = f"""You are the Chief Risk Officer at an elite hedge fund. The head trader wants to place this trade. Your job is to VETO bad trades — not to be nice.
+
+## PROPOSED TRADE
+Symbol: {symbol}
+Direction: {side.upper()}
+Entry: ${entry} | Stop: ${stop} | Target: ${target}
+Trader confidence: {conf:.0%} | R/R: {rr:.1f}
+Trader reasoning: {trader_signal.get("reasoning", "none")}
+
+## MARKET REGIME
+{market_regime.get("regime", "unknown").upper()} | SPY RSI: {market_regime.get("spy_rsi")} | QQQ trend: {market_regime.get("qqq_trend")}
+
+## KEY INDICATORS (1H)
+RSI: {ind_1h.get("rsi")} | MACD histogram: {ind_1h.get("macd_histogram")} | Volume ratio: {ind_1h.get("volume_ratio")}x | EMA trend: {ind_1h.get("ema_trend")} | BB position: {ind_1h.get("bb_pct")}%
+
+## DAILY STRUCTURE
+RSI: {ind_1d.get("rsi")} | EMA trend: {ind_1d.get("ema_trend")} | ATR%: {ind_1d.get("atr_pct")}%
+
+## INSTITUTIONAL FLOW
+{build_institutional_context(intel or {}, symbol)}
+
+## RELATIVE STRENGTH
+{rs_context or "No RS data."}
+
+## CATALYST STACK
+{catalyst_context or "No catalyst data."}
+
+## INSIDER FLOW (Form 4)
+{insider_context or "No insider data."}
+
+## RECENT NEWS
+{chr(10).join(f"- {n.get('headline','')}" for n in news[:4]) or "None."}
+
+## YOUR RISK CHECKLIST — be brutal
+Ask yourself each of these:
+1. Is this trade LATE? (has the move already happened? RSI >72 for longs?)
+2. Is this CROWDED? (if institutional intel shows everyone already long, who's left to buy?)
+3. Is the STOP TOO TIGHT? (stop within 1 bar's noise range?)
+4. Is there a BINARY EVENT risk? (earnings, FOMC, CPI within 24h?)
+5. Is this COUNTER-TREND vs the daily structure?
+6. Is volume BELOW average? (fakeout risk)
+7. Is the R/R actually realistic, or is the target at major resistance?
+8. Is this a CORRELATED CROWDED TRADE? (same direction as obvious consensus?)
+9. Does the stop make structural sense, or is it arbitrary?
+10. Is there a simpler explanation: is this just noise?
+
+Return ONLY valid JSON:
+{{
+  "approved": true | false,
+  "veto_reason": "one clear sentence if vetoed, empty string if approved",
+  "risk_flags": ["flag1", "flag2"],
+  "adjusted_confidence": 0.0-1.0,
+  "officer_note": "one sentence summary of your assessment"
+}}
+
+Approve if: stop is structurally sound, trade is not late, R/R is realistic, no binary events, volume confirms.
+Veto if: ANY of checklist items 1-4 are true, or if 3+ of items 5-10 are true."""
+
+    try:
+        response = claude.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+        result = json.loads(text.strip())
+        approved = result.get("approved", True)
+        reason   = result.get("veto_reason", "")
+        return approved, reason
+    except Exception:
+        return True, ""   # fail open — don't block on parse error
+
 # ---------------------------------------------------------------------------
 # Position sizing
 # ---------------------------------------------------------------------------
@@ -731,6 +921,12 @@ async def execute_signal(signal: dict, portfolio_value: float, open_positions_li
     qty = max(1, min(qty, max_shares))
 
     if qty <= 0:
+        return None
+
+    # --- Spread / slippage guard (live market check before order placement) ---
+    spread_ok, spread_reason = await check_spread_slippage(symbol, entry, stop)
+    if not spread_ok:
+        await log_bot(f"[{symbol}] REJECTED by spread check: {spread_reason}", "warning")
         return None
 
     payload = {
@@ -956,10 +1152,16 @@ async def scan_symbol(
     open_positions: int,
     intel: dict | None = None,
     memory: dict | None = None,
+    rs_intel: dict | None = None,
+    insider_intel: dict | None = None,
     earnings_catalyst: bool = False,
     calendar_context: str = "",
+    scan_id: str = "",
 ) -> Optional[dict]:
     try:
+        # Event: scan started
+        await write_scan_event(scan_id, symbol, "started")
+
         bars_5m, bars_1h, bars_1d = await asyncio.gather(
             fetch_bars(symbol, "5Min",  60),
             fetch_bars(symbol, "1Hour", 60),
@@ -967,6 +1169,8 @@ async def scan_symbol(
         )
 
         if bars_5m.empty or bars_1h.empty:
+            await write_scan_event(scan_id, symbol, "error",
+                rejection_reason="No bar data returned from Alpaca")
             return None
 
         ind_5m = compute_indicators(bars_5m)
@@ -985,8 +1189,31 @@ async def scan_symbol(
             earnings_catalyst=earnings_catalyst,
         )
         advanced_regime = regime.get("advanced_regime") or regime.get("regime", "unknown")
-        setup_quality = score_setup_quality(setup_type, ind_1h, advanced_regime)
-        memory_context = build_memory_prompt_section(memory or {}, symbol)
+        setup_quality   = score_setup_quality(setup_type, ind_1h, advanced_regime)
+        memory_context  = build_memory_prompt_section(memory or {}, symbol)
+        rs_context      = build_rs_prompt_section(rs_intel or {}, symbol)
+        insider_context = build_insider_prompt_section(insider_intel or {}, symbol)
+
+        # Catalyst stack — unified evidence score
+        # Merge 13F institutional + Form 4 insider into one dict for catalyst scoring
+        combined_institutional = dict(intel or {})
+        if insider_intel and symbol in insider_intel:
+            ins = insider_intel[symbol]
+            if hasattr(ins, "as_dict"):
+                combined_institutional.setdefault(f"_insider_{symbol}", ins.as_dict())
+
+        catalyst = build_catalyst_score(
+            symbol=symbol,
+            ind_1h=ind_1h,
+            ind_1d=ind_1d,
+            news=news,
+            earnings_intel={"days_to_earnings": 2} if earnings_catalyst else {"days_to_earnings": 99},
+            institutional_intel=combined_institutional,
+            rs_intel=rs_intel or {},
+            setup_type=setup_type,
+            regime=advanced_regime,
+        )
+        catalyst_context = build_catalyst_prompt_section(catalyst)
 
         signal = await analyze_with_claude(
             symbol, ind_5m, ind_1h, ind_1d,
@@ -999,18 +1226,25 @@ async def scan_symbol(
             calendar_context=calendar_context,
         )
 
+        # Step 1: catalyst stack adjusts confidence
         raw_confidence = float(signal.get("confidence", 0) or 0)
+        catalyst_conf  = catalyst_confidence_boost(catalyst, raw_confidence)
+        signal["catalyst_score"] = catalyst.total_score
+        signal["catalyst_fired"] = catalyst.fired_catalysts
+
+        # Step 2: historical memory calibrates further
         try:
             memory_accuracy = await get_setup_historical_accuracy(
                 require_supabase(),
                 symbol=symbol,
                 regime=advanced_regime,
                 setup_type=setup_type,
-                confidence=raw_confidence,
+                confidence=catalyst_conf,
             )
-            signal["confidence"] = memory_accuracy.get("calibrated_confidence", raw_confidence)
+            signal["confidence"] = memory_accuracy.get("calibrated_confidence", catalyst_conf)
             signal["memory_adjustment"] = memory_accuracy
         except Exception:
+            signal["confidence"] = catalyst_conf
             signal["memory_adjustment"] = {"memory_note": "Memory calibration unavailable."}
 
         regime_rules = regime.get("regime_rules") or trading_rules_for_regime(advanced_regime)
@@ -1019,11 +1253,78 @@ async def scan_symbol(
             float(regime_rules.get("confidence_threshold", MIN_CONFIDENCE)),
         )
 
+        # Step 3: RS score boost on top of everything
+        rs_boost = rs_score_boost(rs_intel or {}, symbol, signal.get("signal", "hold"))
+        signal["confidence"] = min(0.98, signal["confidence"] + rs_boost)
+        signal["rs_boost"] = rs_boost
+
+        # Step 3.5: Insider flow adjustment
+        ins_boost = insider_confidence_boost(insider_intel or {}, symbol, signal.get("signal", "hold"))
+        signal["confidence"] = min(0.98, signal["confidence"] + ins_boost)
+        signal["insider_boost"] = ins_boost
+
+        # Step 4: AI Risk Officer veto check (only for actionable signals)
+        signal["risk_officer_approved"] = True
+        signal["risk_officer_note"]     = ""
+        if signal.get("signal") in ("buy", "sell") and signal.get("confidence", 0) >= MIN_CONFIDENCE:
+            approved, veto_reason = await ai_risk_officer(
+                symbol=symbol,
+                trader_signal=signal,
+                ind_1h=ind_1h,
+                ind_1d=ind_1d,
+                news=news,
+                market_regime=regime,
+                intel=intel,
+                rs_context=rs_context,
+                catalyst_context=catalyst_context,
+                insider_context=insider_context,
+            )
+            signal["risk_officer_approved"] = approved
+            signal["risk_officer_note"]     = veto_reason
+            if not approved:
+                await log_bot(f"[{symbol}] 🛑 Risk Officer VETO: {veto_reason}", "warning")
+                signal["signal"] = "hold"
+                await write_scan_event(
+                    scan_id, symbol, "rejected",
+                    action="veto",
+                    confidence=signal.get("confidence"),
+                    setup_type=setup_type,
+                    setup_quality=setup_quality,
+                    catalyst_score=catalyst.total_score,
+                    rs_signal=(rs_intel or {}).get(symbol, {}).get("rs_signal"),
+                    risk_status="vetoed",
+                    rejection_reason=veto_reason,
+                    payload={"trader_reasoning": signal.get("reasoning", "")},
+                )
+
+        # Event: analyzed — write the final decision for every symbol
+        final_action = signal.get("signal", "hold")
+        is_actionable = final_action in ("buy", "sell")
+        await write_scan_event(
+            scan_id, symbol,
+            "accepted" if is_actionable else "analyzed",
+            action=final_action,
+            confidence=signal.get("confidence"),
+            setup_type=setup_type,
+            setup_quality=setup_quality,
+            catalyst_score=catalyst.total_score,
+            rs_signal=(rs_intel or {}).get(symbol, {}).get("rs_signal"),
+            risk_status="approved" if signal.get("risk_officer_approved", True) else "rejected",
+            payload={
+                "reasoning":       signal.get("reasoning", ""),
+                "catalyst_note":   catalyst.catalyst_note,
+                "rs_note":         (rs_intel or {}).get(symbol, {}).get("rs_note", ""),
+                "memory_note":     signal.get("memory_adjustment", {}).get("memory_note", ""),
+                "insider_context": insider_context,
+                "regime":          advanced_regime,
+            },
+        )
+
         signal["symbol"]     = symbol
         signal["created_at"] = datetime.now(timezone.utc).isoformat()
         signal["strategy"]   = "ascend_elite_v3"
         signal["strength"]   = signal.get("confidence", 0)
-        signal["_score"]     = composite_score(signal, ind_5m, ind_1h, intel)
+        signal["_score"]     = composite_score(signal, ind_5m, ind_1h, intel) + rs_boost
         signal["setup_type"] = setup_type
         signal["setup_quality"] = setup_quality
         signal["setup_confidence"] = setup_confidence
@@ -1055,6 +1356,22 @@ async def scan_symbol(
                     "quality": setup_quality,
                     "min_confidence_required": min_confidence_required,
                     "memory_adjustment": signal.get("memory_adjustment"),
+                },
+                "catalyst": {
+                    "total_score":    catalyst.total_score,
+                    "components":     catalyst.components,
+                    "fired":          catalyst.fired_catalysts,
+                    "dominant":       catalyst.dominant_catalyst,
+                },
+                "relative_strength": rs_intel.get(symbol) if rs_intel else None,
+                "insider_flow": (
+                    insider_intel[symbol].as_dict()
+                    if insider_intel and symbol in insider_intel
+                    else None
+                ),
+                "risk_officer": {
+                    "approved": signal.get("risk_officer_approved", True),
+                    "note":     signal.get("risk_officer_note", ""),
                 },
             },
             "created_at": signal["created_at"],
@@ -1090,7 +1407,8 @@ async def run_scan():
 
     try:
         n = bot_state["scan_count"] + 1
-        await log_bot(f"▶ Scan #{n} | {len(WATCHLIST)} symbols", "info")
+        scan_id = f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{n}"
+        await log_bot(f"▶ Scan #{n} | {len(WATCHLIST)} symbols | id={scan_id}", "info")
 
         trade_allowed, no_trade_reason = should_trade_now()
         calendar_context = get_calendar_context()
@@ -1171,6 +1489,30 @@ async def run_scan():
         except Exception as e:
             await log_bot(f"Signal memory unavailable: {e}", "warning")
 
+        # Fetch relative strength intel once per scan (cached inside module)
+        rs_intel: dict = {}
+        try:
+            rs_intel = await get_relative_strength_intel(WATCHLIST, ALPACA_HEADERS, ALPACA_DATA_URL)
+            leaders = [s for s, v in rs_intel.items() if v.get("rs_signal") == "leader"]
+            laggards = [s for s, v in rs_intel.items() if v.get("rs_signal") == "laggard"]
+            if leaders:
+                await log_bot(f"RS Leaders: {', '.join(leaders[:5])}", "info")
+            if laggards:
+                await log_bot(f"RS Laggards: {', '.join(laggards[:5])}", "info")
+        except Exception as e:
+            await log_bot(f"RS intel error: {e}", "warning")
+
+        # Fetch Form 4 insider buying intel (cached 4h — SEC rate-limited)
+        insider_intel_map: dict = {}
+        try:
+            insider_raw = await get_insider_intel(WATCHLIST)
+            insider_intel_map = insider_raw
+            buyers = [s for s, v in insider_intel_map.items() if v.signal in ("buy", "strong_buy")]
+            if buyers:
+                await log_bot(f"Insider buyers: {', '.join(buyers[:5])}", "info")
+        except Exception as e:
+            await log_bot(f"Insider flow error: {e}", "warning")
+
         # Scan all symbols in batches
         all_signals: list[dict] = []
         for i in range(0, len(ordered_watchlist), BATCH_SIZE):
@@ -1187,6 +1529,9 @@ async def run_scan():
                     memory=memory,
                     earnings_catalyst=sym in earnings_symbols,
                     calendar_context=calendar_context,
+                    rs_intel=rs_intel,
+                    insider_intel=insider_intel_map,
+                    scan_id=scan_id,
                 )
                 for sym in batch
             ])
@@ -1224,7 +1569,14 @@ async def run_scan():
             "info",
         )
 
-        if trade_allowed and not bot_state["circuit_breaker_active"]:
+        no_trade_mode = bot_state.get("no_trade_mode", "strict")
+        execution_blocked = (
+            bot_state["circuit_breaker_active"]
+            or no_trade_mode == "monitor_only"
+            or (not trade_allowed and no_trade_mode == "strict")
+        )
+
+        if not execution_blocked:
             for signal in actionable[:slots]:
                 if not bot_state["running"]:
                     break
@@ -1243,12 +1595,38 @@ async def run_scan():
                             f"target=${signal['take_profit']}",
                             "info",
                         )
+                        await write_scan_event(
+                            scan_id, signal["symbol"], "ordered",
+                            action=signal["signal"],
+                            confidence=signal.get("confidence"),
+                            composite_score=signal.get("_score"),
+                            setup_type=signal.get("setup_type"),
+                            setup_quality=signal.get("setup_quality"),
+                            catalyst_score=signal.get("catalyst_score"),
+                            risk_status="approved",
+                            payload={
+                                "entry_price": signal.get("entry_price"),
+                                "stop_loss":   signal.get("stop_loss"),
+                                "take_profit": signal.get("take_profit"),
+                                "rr":          signal.get("risk_reward_ratio"),
+                                "order_id":    order.get("id"),
+                            },
+                        )
                 except Exception as e:
                     await log_bot(f"Order failed [{signal['symbol']}]: {e}", "error")
+                    await write_scan_event(
+                        scan_id, signal["symbol"], "error",
+                        rejection_reason=str(e),
+                        payload={"error": str(e)},
+                    )
         elif actionable:
+            reason = (
+                "monitor_only mode" if no_trade_mode == "monitor_only"
+                else "circuit breaker active" if bot_state["circuit_breaker_active"]
+                else no_trade_reason or "no-trade gate"
+            )
             await log_bot(
-                f"Execution skipped for {len(actionable)} signal(s): "
-                f"{no_trade_reason or 'circuit breaker active'}",
+                f"Execution skipped for {len(actionable)} signal(s): {reason}",
                 "warning",
             )
 
@@ -1362,6 +1740,33 @@ async def trigger_scan():
         raise HTTPException(400, "Bot not running. Call /start first.")
     asyncio.create_task(run_scan())
     return {"status": "scan_triggered"}
+
+
+@app.post("/config")
+async def update_config(body: dict):
+    """
+    Update runtime bot configuration.
+
+    Accepted keys:
+      no_trade_mode: "strict" | "balanced" | "monitor_only"
+    """
+    allowed = {"no_trade_mode"}
+    valid_modes = {"strict", "balanced", "monitor_only"}
+    updated = {}
+
+    if "no_trade_mode" in body:
+        mode = body["no_trade_mode"]
+        if mode not in valid_modes:
+            raise HTTPException(400, f"no_trade_mode must be one of {valid_modes}")
+        bot_state["no_trade_mode"] = mode
+        updated["no_trade_mode"] = mode
+        await log_bot(f"Config updated: no_trade_mode={mode}", "info")
+
+    unknown = set(body.keys()) - allowed
+    if unknown:
+        raise HTTPException(400, f"Unknown config keys: {unknown}")
+
+    return {"status": "updated", "config": updated}
 
 
 @app.get("/account")

@@ -262,12 +262,15 @@ async def get_setup_historical_accuracy(
 
     mem = _memory_cache.get(symbol)
 
-    if mem is None or mem.sample_size < 5:
+    if mem is None or mem.sample_size < 20:
         return {
-            "sample_size": 0,
+            "sample_size": mem.sample_size if mem else 0,
             "historical_win_rate": None,
             "calibrated_confidence": confidence,
-            "memory_note": f"No historical memory for {symbol} — using raw confidence.",
+            "memory_note": (
+                f"Insufficient historical data for {symbol} "
+                f"({mem.sample_size if mem else 0} signals, need ≥20) — using raw confidence."
+            ),
             "should_boost": False,
             "boost_amount": 0.0,
         }
@@ -321,26 +324,31 @@ def calibrate_confidence(
     Adjust raw model confidence based on empirical historical win rate.
 
     Rules (applied in order, only one fires):
-    - sample_size < 10  → return raw_confidence unchanged
-    - hist_win_rate > raw_confidence + 0.15 → boost by 0.05
-    - hist_win_rate < raw_confidence - 0.20 → reduce by 0.08
+    - sample_size < 20  → return raw_confidence unchanged (insufficient data)
+    - sample_size 20-49 → halve the adjustment magnitude (low-weight zone)
+    - hist_win_rate > raw_confidence + 0.15 → boost by up to +0.05
+    - hist_win_rate < raw_confidence - 0.15 → reduce by up to -0.12 (asymmetric: penalties > boosts)
+    - hist_win_rate < raw_confidence - 0.30 → reduce by up to -0.18 (severe underperformance)
     - Otherwise → no change
 
-    Result is always capped at 0.95.
+    Result is always capped at 0.95. Never boosted above 0.95.
     """
-    if sample_size < 10:
+    if sample_size < 20:
         return raw_confidence
 
+    weight = 0.5 if sample_size < 50 else 1.0
     delta = historical_win_rate - raw_confidence
 
     if delta > 0.15:
-        adjusted = raw_confidence + 0.05
-    elif delta < -0.20:
-        adjusted = raw_confidence - 0.08
+        adjustment = +0.05 * weight
+    elif delta < -0.30:
+        adjustment = -0.18 * weight
+    elif delta < -0.15:
+        adjustment = -0.12 * weight
     else:
-        adjusted = raw_confidence
+        adjustment = 0.0
 
-    return round(min(adjusted, 0.95), 4)
+    return round(min(raw_confidence + adjustment, 0.95), 4)
 
 
 # ---------------------------------------------------------------------------
