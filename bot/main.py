@@ -23,6 +23,7 @@ from dotenv import load_dotenv
 from backtest import fetch_historical_bars, parse_config, run_research_backtest
 from risk_engine import validate_trade, kelly_fraction
 from earnings import get_pre_earnings_opportunities
+from institutional import get_cached_intel, build_institutional_context, institutional_signal_boost
 
 load_dotenv()
 
@@ -276,16 +277,26 @@ def mtf_trend(ind_5m: dict, ind_1h: dict, ind_1d: dict) -> str:
     return "neutral"
 
 
-def composite_score(signal: dict, ind_5m: dict, ind_1h: dict) -> float:
-    """Rank signals beyond just confidence — reward volume + momentum alignment."""
+def composite_score(
+    signal: dict,
+    ind_5m: dict,
+    ind_1h: dict,
+    intel: dict | None = None,
+) -> float:
+    """Rank signals: confidence + volume + momentum + R/R + institutional flow."""
     conf       = signal.get("confidence", 0)
     vol_ratio  = ind_1h.get("volume_ratio", 1.0)
     roc        = abs(ind_5m.get("roc5", 0))
     rr         = signal.get("risk_reward_ratio", 1.0)
-    bonus_vol  = min(vol_ratio / 5.0, 0.15)   # up to +15% for high volume
-    bonus_mom  = min(roc / 20.0, 0.10)        # up to +10% for strong momentum
-    bonus_rr   = min((rr - MIN_RR) / 10.0, 0.10)  # up to +10% for great R/R
-    return conf + bonus_vol + bonus_mom + bonus_rr
+    symbol     = signal.get("symbol", "")
+    side       = signal.get("signal", "hold")
+
+    bonus_vol   = min(vol_ratio / 5.0, 0.15)
+    bonus_mom   = min(roc / 20.0, 0.10)
+    bonus_rr    = min((rr - MIN_RR) / 10.0, 0.10)
+    bonus_intel = institutional_signal_boost(intel or {}, symbol, side)
+
+    return conf + bonus_vol + bonus_mom + bonus_rr + bonus_intel
 
 
 def _parse_ts(value: str) -> datetime:
@@ -461,6 +472,7 @@ async def analyze_with_claude(
     market_regime: dict,
     portfolio_value: float,
     open_positions: int,
+    intel: dict | None = None,
 ) -> dict:
     if claude is None:
         return {
@@ -477,12 +489,17 @@ async def analyze_with_claude(
         for n in news[:6]
     ) or "No recent news."
 
+    institutional_text = build_institutional_context(intel or {}, symbol)
+
     prompt = f"""You are the head trader at an elite quantitative hedge fund. You manage a high-conviction momentum portfolio. Your mandate: find asymmetric opportunities with exceptional risk/reward. You do not trade mediocre setups.
 
 ## MARKET CONTEXT
 Regime: {market_regime.get('regime', 'unknown').upper()}
 SPY: trend={market_regime.get('spy_trend')} | RSI={market_regime.get('spy_rsi')} | Δ={market_regime.get('spy_change')}% | vol={market_regime.get('spy_vol_ratio')}x
 QQQ: trend={market_regime.get('qqq_trend')} | RSI={market_regime.get('qqq_rsi')}
+
+## SMART MONEY POSITIONING
+{institutional_text}
 
 ## TARGET: {symbol}
 Multi-Timeframe Alignment: {trend.upper()}
@@ -887,6 +904,7 @@ async def scan_symbol(
     regime: dict,
     portfolio_value: float,
     open_positions: int,
+    intel: dict | None = None,
 ) -> Optional[dict]:
     try:
         bars_5m, bars_1h, bars_1d = await asyncio.gather(
@@ -909,13 +927,14 @@ async def scan_symbol(
         signal = await analyze_with_claude(
             symbol, ind_5m, ind_1h, ind_1d,
             news, regime, portfolio_value, open_positions,
+            intel=intel,
         )
 
         signal["symbol"]     = symbol
         signal["created_at"] = datetime.now(timezone.utc).isoformat()
         signal["strategy"]   = "ascend_elite_v3"
         signal["strength"]   = signal.get("confidence", 0)
-        signal["_score"]     = composite_score(signal, ind_5m, ind_1h)
+        signal["_score"]     = composite_score(signal, ind_5m, ind_1h, intel)
 
         db = require_supabase()
         signal_insert = db.table("signals").insert({
@@ -1013,9 +1032,22 @@ async def run_scan():
             await log_bot(f"Earnings scan error: {exc}", "warning")
 
         # Build scan order: earnings symbols first, then the rest
-        earnings_first   = [s for s in WATCHLIST if s in earnings_symbols]
-        non_earnings     = [s for s in WATCHLIST if s not in earnings_symbols]
+        earnings_first    = [s for s in WATCHLIST if s in earnings_symbols]
+        non_earnings      = [s for s in WATCHLIST if s not in earnings_symbols]
         ordered_watchlist = earnings_first + non_earnings
+
+        # Fetch institutional intel (cached — only hits SEC once per 24h)
+        intel: dict = {}
+        try:
+            intel = await get_cached_intel(WATCHLIST)
+            accumulating = [s for s, v in intel.items() if v.signal == "accumulating"]
+            distributing = [s for s, v in intel.items() if v.signal == "distributing"]
+            if accumulating:
+                await log_bot(f"Smart money ACCUMULATING: {', '.join(accumulating)}", "info")
+            if distributing:
+                await log_bot(f"Smart money DISTRIBUTING: {', '.join(distributing)}", "info")
+        except Exception as e:
+            await log_bot(f"Institutional intel error: {e}", "warning")
 
         # Scan all symbols in batches
         all_signals: list[dict] = []
@@ -1024,7 +1056,7 @@ async def run_scan():
                 return
             batch   = ordered_watchlist[i : i + BATCH_SIZE]
             results = await asyncio.gather(*[
-                scan_symbol(sym, regime, portfolio_value, open_positions)
+                scan_symbol(sym, regime, portfolio_value, open_positions, intel=intel)
                 for sym in batch
             ])
             for s in results:
