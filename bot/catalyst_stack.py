@@ -170,8 +170,14 @@ def _score_institutional(institutional_intel: dict, symbol: str) -> tuple[float,
     if not sym_data:
         return 0.0, None
 
-    flow       = str(sym_data.get("flow", sym_data.get("signal", ""))).lower()
-    conviction = float(sym_data.get("conviction", sym_data.get("conviction_score", 0.0)) or 0.0)
+    if hasattr(sym_data, "__dict__"):
+        flow = str(getattr(sym_data, "flow", getattr(sym_data, "signal", ""))).lower()
+        conviction = float(
+            getattr(sym_data, "conviction", getattr(sym_data, "conviction_score", 0.0)) or 0.0
+        )
+    else:
+        flow = str(sym_data.get("flow", sym_data.get("signal", ""))).lower()
+        conviction = float(sym_data.get("conviction", sym_data.get("conviction_score", 0.0)) or 0.0)
 
     accumulating = any(w in flow for w in ("accumulating", "buying", "accumulate", "buy"))
     distributing = any(w in flow for w in ("distributing", "selling", "distribute", "sell"))

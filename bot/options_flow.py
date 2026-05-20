@@ -452,6 +452,8 @@ def options_flow_confidence_boost(
         return 0.0
 
     raw = signal_side.lower()
+    if raw not in ("buy", "long", "sell", "short"):
+        return 0.0
     is_long = raw in ("buy", "long")
     flow    = info.flow_signal
     conv    = info.conviction_score

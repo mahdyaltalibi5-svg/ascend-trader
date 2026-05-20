@@ -526,6 +526,8 @@ def insider_confidence_boost(intel: dict[str, InsiderIntel], symbol: str, side: 
         return 0.0
 
     raw = side.lower()
+    if raw not in ("buy", "long", "sell", "short"):
+        return 0.0
     is_long = raw in ("buy", "long")
 
     if info.signal == "strong_buy":

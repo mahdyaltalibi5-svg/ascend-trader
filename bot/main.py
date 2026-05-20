@@ -211,7 +211,12 @@ async def alpaca_delete(path: str) -> bool:
         return r.status_code in (200, 204)
 
 
-async def check_spread_slippage(symbol: str, entry_price: float, stop_loss: float) -> tuple[bool, str]:
+async def check_spread_slippage(
+    symbol: str,
+    side: str,
+    entry_price: float,
+    stop_loss: float,
+) -> tuple[bool, str]:
     """
     Fetch latest quote and reject if spread is too wide or estimated slippage
     breaks the trade's R/R.
@@ -234,10 +239,10 @@ async def check_spread_slippage(symbol: str, entry_price: float, stop_loss: floa
         if spread_pct > 0.005:
             return False, f"Spread too wide: {spread_pct*100:.2f}% ({bid:.2f}/{ask:.2f})"
 
-        # Estimate slippage: assume worst-case fill at ask (long) or bid (short)
+        # Estimate slippage: assume crossing the spread in the trade direction.
         # If slippage eats > 20% of the R, kill the trade
         risk_per_share = abs(entry_price - stop_loss)
-        slippage       = ask - mid  # cost of crossing the spread
+        slippage = (ask - mid) if side.lower() in ("buy", "long") else (mid - bid)
         if risk_per_share > 0 and slippage / risk_per_share > 0.20:
             return False, (
                 f"Slippage risk too high: spread costs {slippage:.3f} "
@@ -975,7 +980,7 @@ async def execute_signal(signal: dict, portfolio_value: float, open_positions_li
         return None
 
     # --- Spread / slippage guard (live market check before order placement) ---
-    spread_ok, spread_reason = await check_spread_slippage(symbol, entry, stop)
+    spread_ok, spread_reason = await check_spread_slippage(symbol, side, entry, stop)
     if not spread_ok:
         await log_bot(f"[{symbol}] REJECTED by spread check: {spread_reason}", "warning")
         return None

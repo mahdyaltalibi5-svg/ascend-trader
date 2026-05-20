@@ -35,5 +35,17 @@ create policy "service role all" on scan_events
 create policy "anon read" on scan_events
   for select using (true);
 
--- Realtime: subscribe to new scan events for live dashboard feed
-alter publication supabase_realtime add table scan_events;
+-- Realtime: subscribe to new scan events for live dashboard feed.
+do $$
+begin
+  if exists (select 1 from pg_publication where pubname = 'supabase_realtime')
+     and not exists (
+       select 1
+       from pg_publication_tables
+       where pubname = 'supabase_realtime'
+         and schemaname = 'public'
+         and tablename = 'scan_events'
+     ) then
+    alter publication supabase_realtime add table scan_events;
+  end if;
+end $$;

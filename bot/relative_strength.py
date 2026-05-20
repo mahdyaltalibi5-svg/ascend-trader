@@ -398,6 +398,8 @@ def rs_score_boost(rs_intel: dict, symbol: str, signal_side: str) -> float:
     # Normalise: Alpaca signals are "buy"/"sell"; internal may be "long"/"short"
     raw = signal_side.lower()
     side = "long" if raw in ("buy", "long") else ("short" if raw in ("sell", "short") else raw)
+    if side not in ("long", "short"):
+        return 0.0
 
     if rs_signal == "leader":
         return +0.08 if side == "long" else -0.10
