@@ -40,6 +40,12 @@ from signal_memory import (
     get_symbols_to_avoid,
     get_weakness_report,
 )
+from signal_attribution import (
+    build_attribution_row,
+    get_component_stats,
+    build_attribution_prompt_section,
+    load_attribution_rows,
+)
 
 load_dotenv()
 
@@ -140,6 +146,10 @@ bot_state = {
 
 scan_task:    Optional[asyncio.Task] = None
 monitor_task: Optional[asyncio.Task] = None
+
+# Track trade IDs that have already had a partial-profit close so we don't
+# fire the partial-take twice on the same position.
+_partial_taken: set[str] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +554,27 @@ async def evaluate_signal_outcomes(limit: int = 40) -> dict:
             ).execute()
             db.table("signals").update({"outcome_checked_at": checked_at}).eq("id", sig["id"]).execute()
             evaluated += 1
+
+            # Write attribution row — non-fatal if attribution table not yet migrated
+            try:
+                outcome_row = {
+                    "outcome_score": score,
+                    "r_multiple": round(ret_1d, 3) if ret_1d is not None else 0.0,
+                    "hit_stop": hit_stop,
+                    "hit_take_profit": hit_target,
+                }
+                attr_row = build_attribution_row(
+                    signal_id=sig["id"],
+                    symbol=sig["symbol"],
+                    signal_record=sig,
+                    outcome_record=outcome_row,
+                )
+                db.table("signal_attribution").upsert(
+                    attr_row, on_conflict="signal_id"
+                ).execute()
+            except Exception:
+                pass  # attribution is telemetry — never crash for it
+
         except Exception as e:
             errors += 1
             await log_bot(f"Signal outcome error [{sig.get('symbol')}]: {e}", "error")
@@ -1098,8 +1129,23 @@ async def execute_signal(signal: dict, portfolio_value: float, open_positions_li
 # ---------------------------------------------------------------------------
 # Position monitor — trailing stops + P&L sync
 # ---------------------------------------------------------------------------
+def _is_eod_exit_window() -> bool:
+    """Return True if it's within the last 15 minutes of the NYSE session (after 3:45 PM ET).
+    Uses UTC: 3:45 PM EDT = 19:45 UTC; 3:45 PM EST = 20:45 UTC.
+    We check both windows to handle DST transitions safely.
+    """
+    now = datetime.now(timezone.utc)
+    # EDT window (March–Nov): market close = 20:00 UTC, gate = 19:45 UTC
+    # EST window (Nov–Mar):  market close = 21:00 UTC, gate = 20:45 UTC
+    h, m = now.hour, now.minute
+    edt_gate = (h == 19 and m >= 45) or h == 20
+    est_gate = (h == 20 and m >= 45) or h == 21
+    return edt_gate or est_gate
+
+
 async def monitor_positions():
-    """Run every MONITOR_INTERVAL seconds. Manage open positions actively."""
+    """Run every MONITOR_INTERVAL seconds. Active position management:
+    trailing stops, partial profit takes, time-based exits."""
     try:
         positions_resp = await alpaca_get("/v2/positions")
         if not isinstance(positions_resp, list) or not positions_resp:
@@ -1108,6 +1154,8 @@ async def monitor_positions():
         open_orders = await alpaca_get("/v2/orders?status=open&limit=200")
         if not isinstance(open_orders, list):
             open_orders = []
+
+        eod = _is_eod_exit_window()
 
         for pos in positions_resp:
             symbol  = pos["symbol"]
@@ -1121,7 +1169,7 @@ async def monitor_positions():
             db = require_supabase()
             res = (
                 db.table("trades")
-                .select("stop_loss, exit_price, id")
+                .select("stop_loss, exit_price, id, entry_at, created_at")
                 .eq("symbol", symbol)
                 .eq("status", "open")
                 .order("created_at", desc=True)
@@ -1131,9 +1179,11 @@ async def monitor_positions():
             if not res.data:
                 continue
 
-            trade      = res.data[0]
-            orig_stop  = trade.get("stop_loss")
+            trade       = res.data[0]
+            trade_id    = trade["id"]
+            orig_stop   = trade.get("stop_loss")
             orig_target = trade.get("exit_price")
+            entry_at_str = trade.get("entry_at") or trade.get("created_at", "")
 
             if not orig_stop:
                 continue
@@ -1142,24 +1192,74 @@ async def monitor_positions():
             if initial_risk <= 0:
                 continue
 
-            # How many R multiples have we achieved?
+            # ── Time-based exit: force-close at end of session ──────────────
+            hours_held = 0.0
+            if entry_at_str:
+                try:
+                    entry_dt = datetime.fromisoformat(entry_at_str.replace("Z", "+00:00"))
+                    hours_held = (datetime.now(timezone.utc) - entry_dt).total_seconds() / 3600
+                except Exception:
+                    pass
+
+            # EOD forced close — don't hold overnight without a deliberate swing setup
+            if eod and hours_held < 24:
+                await log_bot(f"[{symbol}] EOD forced close after {hours_held:.1f}h held", "warning")
+                await _close_full_position(symbol)
+                continue
+
+            # Max hold: 72 hours (3 calendar days) regardless of outcome
+            if hours_held > 72:
+                await log_bot(f"[{symbol}] Max hold time (72h) reached — closing", "warning")
+                await _close_full_position(symbol)
+                continue
+
+            # ── R-multiple tracking ──────────────────────────────────────────
             if side == "long":
-                gain   = current - entry
-                rr     = gain / initial_risk
+                gain = current - entry
+                rr   = gain / initial_risk
+            else:
+                gain = entry - current
+                rr   = gain / initial_risk
+
+            # ── Partial profit take at 1.5R (50% of position) ───────────────
+            if rr >= 1.5 and trade_id not in _partial_taken and qty >= 2:
+                partial_qty = qty // 2
+                close_side  = "sell" if side == "long" else "buy"
+                try:
+                    await alpaca_post("/v2/orders", {
+                        "symbol":        symbol,
+                        "qty":           str(partial_qty),
+                        "side":          close_side,
+                        "type":          "market",
+                        "time_in_force": "day",
+                    })
+                    _partial_taken.add(trade_id)
+                    await log_bot(
+                        f"[{symbol}] 💰 Partial profit: closed {partial_qty} of {qty} shares at {rr:.2f}R "
+                        f"(${current:.2f}, gain=${gain*partial_qty:.0f})",
+                        "info",
+                    )
+                except Exception as exc:
+                    await log_bot(f"[{symbol}] Partial close failed: {exc}", "error")
+
+            # ── Trailing stop progression ────────────────────────────────────
+            if side == "long":
                 new_stop = None
-                if rr >= 2.0:
-                    new_stop = entry + initial_risk           # lock in 1R profit
+                if rr >= 2.5:
+                    new_stop = entry + initial_risk * 1.5   # lock in 1.5R
+                elif rr >= 2.0:
+                    new_stop = entry + initial_risk          # lock in 1R
                 elif rr >= 1.0:
-                    new_stop = entry + 0.02                   # move to break-even
+                    new_stop = entry + 0.02                  # break-even
 
                 if new_stop and new_stop > orig_stop:
                     await _replace_stop(symbol, qty, "sell", new_stop, open_orders, orig_stop)
 
             elif side == "short":
-                gain   = entry - current
-                rr     = gain / initial_risk
                 new_stop = None
-                if rr >= 2.0:
+                if rr >= 2.5:
+                    new_stop = entry - initial_risk * 1.5
+                elif rr >= 2.0:
                     new_stop = entry - initial_risk
                 elif rr >= 1.0:
                     new_stop = entry - 0.02
@@ -1168,12 +1268,20 @@ async def monitor_positions():
                     await _replace_stop(symbol, qty, "buy", new_stop, open_orders, orig_stop)
 
             # Sync live P&L to Supabase
-            db.table("trades").update({"pnl": round(unreal, 2)}).eq("id", trade["id"]).execute()
+            db.table("trades").update({"pnl": round(unreal, 2)}).eq("id", trade_id).execute()
 
         bot_state["last_monitor_at"] = datetime.now(timezone.utc).isoformat()
 
     except Exception as e:
         await log_bot(f"Position monitor error: {e}", "error")
+
+
+async def _close_full_position(symbol: str) -> None:
+    """Market-close an entire open position via Alpaca."""
+    try:
+        await alpaca_delete(f"/v2/positions/{symbol}")
+    except Exception as exc:
+        await log_bot(f"[{symbol}] Full position close failed: {exc}", "error")
 
 
 async def _replace_stop(
@@ -1747,7 +1855,15 @@ async def run_scan():
             await log_bot(f"Short interest error: {e}", "warning")
 
         # Build the learning brief from memory (injected into every Claude prompt)
-        learning_brief = get_learning_brief()
+        # Augment with signal attribution insights so Claude knows which signals are predictive
+        base_brief = get_learning_brief()
+        try:
+            attr_rows = await load_attribution_rows(require_supabase(), limit=300)
+            attr_insights = get_component_stats(attr_rows)
+            attribution_section = build_attribution_prompt_section(attr_insights)
+            learning_brief = f"{base_brief}\n\n{attribution_section}" if base_brief else attribution_section
+        except Exception:
+            learning_brief = base_brief
 
         # Check the weakness report — skip symbols the bot is systematically bad at
         symbols_to_avoid = get_symbols_to_avoid()

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # ETF symbols used for regime detection
 # ---------------------------------------------------------------------------
-REGIME_SYMBOLS = ["SPY", "QQQ", "SMH", "XLK", "IWM"]
+REGIME_SYMBOLS = ["SPY", "QQQ", "SMH", "XLK", "IWM", "VIXY"]
 
 VALID_REGIMES = {
     "trend_day",
@@ -189,12 +189,45 @@ async def fetch_regime_bars(
 # Regime classification
 # ---------------------------------------------------------------------------
 
+def _vixy_signal(vixy_bars: pd.DataFrame) -> tuple[str, float]:
+    """
+    Derive a VIX-proxy signal from VIXY (ProShares VIX Short-Term ETF).
+
+    VIXY rises when VIX spikes. We measure VIXY's current price vs its
+    20-bar moving average to determine the volatility environment.
+
+    Returns (signal, ratio):
+        signal: "panic" | "elevated" | "normal" | "suppressed"
+        ratio : current price / 20-bar MA (> 1 = elevated vol)
+    """
+    if vixy_bars.empty or len(vixy_bars) < 21:
+        return "normal", 1.0
+
+    close = vixy_bars["close"]
+    ma20 = float(close.rolling(20).mean().iloc[-1])
+    current = float(close.iloc[-1])
+
+    if ma20 <= 0:
+        return "normal", 1.0
+
+    ratio = current / ma20
+
+    if ratio >= 1.40:
+        return "panic", ratio
+    if ratio >= 1.15:
+        return "elevated", ratio
+    if ratio <= 0.85:
+        return "suppressed", ratio
+    return "normal", ratio
+
+
 def classify_regime(
     spy_bars: pd.DataFrame,
     qqq_bars: pd.DataFrame,
     smh_bars: pd.DataFrame,
     xlk_bars: pd.DataFrame,
     iwm_bars: pd.DataFrame,
+    vixy_bars: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
     """
     Classify the current market regime from ETF bar data.
@@ -252,6 +285,9 @@ def classify_regime(
         baseline_atr = float(tr.iloc[-22:-5].mean())
         atr_expansion = recent_atr / baseline_atr if baseline_atr > 0 else 1.0
 
+    # VIX proxy via VIXY ETF
+    vixy_signal, vixy_ratio = _vixy_signal(vixy_bars if vixy_bars is not None else pd.DataFrame())
+
     # -----------------------------------------------------------------------
     # Regime scoring — evaluate each candidate and pick the highest-scoring
     # -----------------------------------------------------------------------
@@ -284,6 +320,14 @@ def classify_regime(
         scores["high_vol_panic"] += 0.2
     if vol_r > 1.5:
         scores["high_vol_panic"] += 0.2
+    # VIXY (VIX proxy) amplification
+    if vixy_signal == "panic":
+        scores["high_vol_panic"] += 0.40          # hard override toward panic
+        scores["trend_day"]       = max(0.0, scores["trend_day"] - 0.30)
+        scores["risk_on"]         = max(0.0, scores["risk_on"]   - 0.20)
+    elif vixy_signal == "elevated":
+        scores["high_vol_panic"] += 0.20
+        scores["trend_day"]       = max(0.0, scores["trend_day"] - 0.10)
 
     # ---- low_vol_drift -----------------------------------------------------
     if vol_r < 0.6:
@@ -292,6 +336,8 @@ def classify_regime(
         scores["low_vol_drift"] += 0.3
     if spy_adx < 15:
         scores["low_vol_drift"] += 0.2
+    if vixy_signal == "suppressed":
+        scores["low_vol_drift"] += 0.20           # very low VIX = drift environment
 
     # ---- risk_on -----------------------------------------------------------
     if qqq_vs_spy > 0.005:
@@ -396,6 +442,8 @@ def classify_regime(
         "smh_vs_spy_rs": round(smh_vs_spy, 4),
         "vol_ratio": round(vol_r, 3),
         "bb_width": round(spy_bbw, 4),
+        "vix_proxy_signal": vixy_signal,
+        "vix_proxy_ratio": round(vixy_ratio, 3),
         "regime_note": notes.get(best_regime, ""),
     }
 
@@ -421,6 +469,7 @@ async def get_full_regime(
             smh_bars=bars.get("SMH", pd.DataFrame()),
             xlk_bars=bars.get("XLK", pd.DataFrame()),
             iwm_bars=bars.get("IWM", pd.DataFrame()),
+            vixy_bars=bars.get("VIXY", pd.DataFrame()),
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("get_full_regime failed: %s", exc, exc_info=True)
