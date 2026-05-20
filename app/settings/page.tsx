@@ -4,6 +4,7 @@ import { useState, useCallback, useEffect, useRef } from "react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Bot, ShieldAlert, Plus, X, Power, AlertCircle } from "lucide-react";
 import { BotStatusBadge } from "@/components/ui/BotStatusBadge";
+import { BotCommandCenter } from "@/components/bot/BotCommandCenter";
 import { useRealtimeTrades } from "@/hooks/useRealtime";
 import { createClient } from "@/lib/supabase/client";
 import { useBotStatus } from "@/hooks/useBotStatus";
@@ -144,6 +145,8 @@ export default function SettingsPage() {
       </div>
 
       <div className="flex-1 space-y-5 p-6">
+        <BotCommandCenter compact />
+
         {/* Bot Controls */}
         <Section title="Bot Controls" icon={Bot}>
           <div className="flex items-center justify-between">

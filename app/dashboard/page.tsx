@@ -16,6 +16,7 @@ import { SignalStrengthBar } from "@/components/ui/SignalStrengthBar";
 import { ChartSkeleton, TradeRowSkeleton, SignalCardSkeleton } from "@/components/ui/LoadingSkeleton";
 import { EquityChart } from "@/components/charts/EquityChart";
 import { TradingViewChart } from "@/components/charts/TradingViewChart";
+import { BotCommandCenter } from "@/components/bot/BotCommandCenter";
 import { usePortfolio } from "@/hooks/usePortfolio";
 import { useTrades } from "@/hooks/useTrades";
 import { useRealtimeSignals, useRealtimeTrades } from "@/hooks/useRealtime";
@@ -91,6 +92,8 @@ export default function DashboardPage() {
       </div>
 
       <div className="flex-1 space-y-6 p-6">
+        <BotCommandCenter />
+
         {/* Stat cards */}
         <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
           <StatCard
@@ -272,4 +275,3 @@ export default function DashboardPage() {
     </div>
   );
 }
-

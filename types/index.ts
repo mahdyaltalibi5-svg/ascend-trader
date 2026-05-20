@@ -146,11 +146,21 @@ export interface PortfolioSnapshot {
 
 export interface BotStatus {
   running: boolean;
+  circuit_breaker_active?: boolean;
   strategy: string;
+  last_scan_at?: string | null;
   last_signal_at: string | null;
+  last_monitor_at?: string | null;
+  last_outcome_eval_at?: string | null;
   trades_today: number;
+  signals_today?: number;
+  wins_today?: number;
+  losses_today?: number;
   win_rate: number;
+  day_pnl?: number;
+  scan_count?: number;
   uptime_seconds: number;
+  error?: string;
 }
 
 export interface BotLog {
