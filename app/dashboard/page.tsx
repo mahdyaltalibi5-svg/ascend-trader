@@ -22,6 +22,7 @@ import {
   ListChecks,
   MessageSquareText,
   Eye,
+  Newspaper,
   Radio,
   Route,
   ScanLine,
@@ -178,6 +179,7 @@ export default function DashboardPage() {
   const [logsLoading, setLogsLoading] = useState(true);
   const [marketSymbol, setMarketSymbol] = useState(WATCHLIST[0]);
   const [clock, setClock] = useState("--:--");
+  const [morningBriefing, setMorningBriefing] = useState<Record<string, unknown> | null>(null);
 
   const supabase = createClient();
 
@@ -185,6 +187,15 @@ export default function DashboardPage() {
     setClock(formatClock());
     const timer = window.setInterval(() => setClock(formatClock()), 30000);
     return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    fetch("/api/morning-briefing")
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.briefing) setMorningBriefing(d.briefing as Record<string, unknown>);
+      })
+      .catch(() => undefined);
   }, []);
 
   useEffect(() => {
@@ -413,6 +424,8 @@ export default function DashboardPage() {
         </div>
 
         <BotCommandCenter />
+
+        {morningBriefing && <MorningBriefingWidget briefing={morningBriefing} />}
 
         <div className="grid grid-cols-1 gap-6 xl:grid-cols-12">
           <section className="glass overflow-hidden rounded-2xl xl:col-span-7">
@@ -1197,6 +1210,72 @@ function EmptyState({
       </div>
       <p className="text-sm font-semibold text-primary">{title}</p>
       <p className="mt-1 max-w-xs text-xs text-muted">{detail}</p>
+    </div>
+  );
+}
+
+function MorningBriefingWidget({ briefing }: { briefing: Record<string, unknown> }) {
+  const [expanded, setExpanded] = useState(false);
+
+  const text = typeof briefing.briefing_text === "string" ? briefing.briefing_text : "";
+  const generatedAt = typeof briefing.generated_at === "string" ? briefing.generated_at : "";
+  const topMovers = Array.isArray(briefing.top_movers) ? briefing.top_movers as Array<Record<string, unknown>> : [];
+
+  const dateLabel = generatedAt
+    ? new Date(generatedAt).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+    : "";
+
+  return (
+    <div className="glass overflow-hidden rounded-2xl border border-amber-300/10">
+      <button
+        onClick={() => setExpanded((p) => !p)}
+        className="flex w-full items-center justify-between px-5 py-4 text-left"
+      >
+        <div className="flex items-center gap-3">
+          <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-white/[0.08] bg-amber-300/[0.07]">
+            <Newspaper className="h-4 w-4 text-amber-300" />
+          </div>
+          <div>
+            <p className="text-xs font-bold uppercase tracking-widest text-amber-300">Pre-Market Briefing</p>
+            {dateLabel && <p className="text-[10px] text-muted">{dateLabel}</p>}
+          </div>
+        </div>
+        <span className="text-[10px] text-muted">{expanded ? "collapse" : "expand"}</span>
+      </button>
+
+      <AnimatePresence>
+        {expanded && (
+          <motion.div
+            initial={{ height: 0, opacity: 0 }}
+            animate={{ height: "auto", opacity: 1 }}
+            exit={{ height: 0, opacity: 0 }}
+            transition={{ duration: 0.2 }}
+            className="overflow-hidden"
+          >
+            <div className="space-y-4 border-t border-white/[0.06] px-5 pb-5 pt-4">
+              {topMovers.length > 0 && (
+                <div className="flex flex-wrap gap-2">
+                  {topMovers.map((m) => {
+                    const gapPct = Number(m.gap_pct ?? 0);
+                    return (
+                      <div
+                        key={String(m.symbol)}
+                        className="rounded-lg border border-white/[0.06] bg-base/60 px-3 py-1.5 text-center"
+                      >
+                        <p className="font-space text-xs font-bold text-primary">{String(m.symbol)}</p>
+                        <p className={cn("font-space text-[10px] font-semibold", gapPct >= 0 ? "text-success" : "text-danger")}>
+                          {gapPct >= 0 ? "+" : ""}{gapPct.toFixed(2)}%
+                        </p>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+              <p className="whitespace-pre-wrap text-xs leading-relaxed text-primary/90">{text}</p>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   );
 }

@@ -47,6 +47,12 @@ from signal_attribution import (
     build_attribution_prompt_section,
     load_attribution_rows,
 )
+from news_sentiment import (
+    get_news_sentiment,
+    build_news_sentiment_prompt_section,
+    apply_news_sentiment_adjustment,
+)
+from premarket_briefing import generate_morning_briefing
 
 load_dotenv()
 
@@ -147,14 +153,18 @@ bot_state = {
     "no_trade_mode":           "strict",
 }
 
-scan_task:    Optional[asyncio.Task] = None
-monitor_task: Optional[asyncio.Task] = None
+scan_task:      Optional[asyncio.Task] = None
+monitor_task:   Optional[asyncio.Task] = None
+briefing_task:  Optional[asyncio.Task] = None
 
 # Track trade IDs that have already had a partial-profit close so we don't
 # fire the partial-take twice on the same position.
 _partial_taken: set[str] = set()
 EASTERN_TZ = ZoneInfo("America/New_York")
 _exit_reviewed_at: dict[str, datetime] = {}
+
+# Date of the last successfully generated morning briefing (YYYY-MM-DD in ET)
+_briefing_generated_date: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -737,6 +747,7 @@ async def analyze_with_claude(
     short_context: str = "",
     rs_context: str = "",
     insider_context: str = "",
+    news_sentiment_context: str = "",
 ) -> dict:
     if claude is None:
         return {
@@ -796,6 +807,9 @@ Multi-Timeframe Alignment: {trend.upper()}
 
 ## NEWS & CATALYSTS
 {news_text}
+
+## NEWS SENTIMENT (Claude-scored headlines)
+{news_sentiment_context or "No news sentiment data."}
 
 ## RELATIVE STRENGTH
 {rs_context or "No RS data."}
@@ -1720,6 +1734,11 @@ async def scan_symbol(
             return None
 
         news = await fetch_news(symbol)
+
+        # Score news sentiment (30-min cache; returns quickly if no headlines)
+        news_sentiment = await get_news_sentiment(symbol, news, claude)
+        news_sentiment_ctx = build_news_sentiment_prompt_section(news_sentiment, symbol)
+
         setup_type, setup_confidence = classify_setup(
             ind_5m,
             ind_1h,
@@ -1770,6 +1789,7 @@ async def scan_symbol(
             short_context=short_context,
             rs_context=rs_context,
             insider_context=insider_context,
+            news_sentiment_context=news_sentiment_ctx,
         )
 
         # Step 1: catalyst stack adjusts confidence
@@ -1818,6 +1838,10 @@ async def scan_symbol(
         si_boost = short_interest_confidence_boost(short_intel or {}, symbol, signal.get("signal", "hold"))
         signal["confidence"] = min(0.98, signal["confidence"] + si_boost)
         signal["short_interest_boost"] = si_boost
+
+        # Step 3.8: News sentiment adjustment, aligned to trade direction.
+        apply_news_sentiment_adjustment(signal, news_sentiment)
+
         signal["_score"] = composite_score(signal, ind_5m, ind_1h, intel) + rs_boost
 
         # Step 4: AI Risk Officer veto check (only for actionable signals)
@@ -1904,6 +1928,9 @@ async def scan_symbol(
                     if options_flow_intel and symbol in options_flow_intel
                     else None
                 ),
+                "news_sentiment_boost": signal.get("news_sentiment_boost"),
+                "news_sentiment_raw_boost": signal.get("news_sentiment_raw_boost"),
+                "news_sentiment": signal.get("news_sentiment"),
                 "short_interest": (
                     short_intel[symbol].as_dict()
                     if short_intel and symbol in short_intel
@@ -1962,6 +1989,8 @@ async def scan_symbol(
                 "insider_boost": signal.get("insider_boost"),
                 "options_flow_boost": signal.get("options_flow_boost"),
                 "short_interest_boost": signal.get("short_interest_boost"),
+                "news_sentiment_boost": signal.get("news_sentiment_boost"),
+                "news_sentiment_raw_boost": signal.get("news_sentiment_raw_boost"),
                 "setup": {
                     "type": setup_type,
                     "classification_confidence": setup_confidence,
@@ -2372,6 +2401,34 @@ async def monitor_loop():
                 return
             await asyncio.sleep(1)
 
+
+async def briefing_loop():
+    """Fire a pre-market briefing at 8 AM ET each trading day."""
+    global _briefing_generated_date
+    while bot_state["running"]:
+        now_et = datetime.now(EASTERN_TZ)
+        today_str = now_et.strftime("%Y-%m-%d")
+        if now_et.hour == 8 and _briefing_generated_date != today_str:
+            try:
+                await log_bot("📋 Generating pre-market morning briefing…", "info")
+                await generate_morning_briefing(
+                    watchlist=WATCHLIST,
+                    alpaca_headers=ALPACA_HEADERS,
+                    alpaca_data_url=ALPACA_DATA_URL,
+                    claude_client=claude,
+                    supabase=require_supabase(),
+                )
+                _briefing_generated_date = today_str
+                await log_bot("📋 Pre-market briefing saved.", "info")
+            except Exception as exc:
+                await log_bot(f"Briefing generation failed: {exc}", "error")
+        # Check every 5 minutes
+        for _ in range(300):
+            if not bot_state["running"]:
+                return
+            await asyncio.sleep(1)
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -2380,7 +2437,7 @@ async def lifespan(app: FastAPI):
     bot_state["started_at"] = datetime.now(timezone.utc).isoformat()
     await log_bot("🚀 Ascend Trader Elite v3 initialized", "info")
     yield
-    for t in [scan_task, monitor_task]:
+    for t in [scan_task, monitor_task, briefing_task]:
         if t and not t.done():
             t.cancel()
 
@@ -2413,24 +2470,25 @@ async def get_status():
 
 @app.post("/start")
 async def start_bot():
-    global scan_task, monitor_task
+    global scan_task, monitor_task, briefing_task
     if bot_state["running"]:
         return {"status": "already_running"}
     bot_state.update(
         running=True, circuit_breaker_active=False,
         trades_today=0, signals_today=0, scan_count=0,
     )
-    scan_task    = asyncio.create_task(scanner_loop())
-    monitor_task = asyncio.create_task(monitor_loop())
+    scan_task     = asyncio.create_task(scanner_loop())
+    monitor_task  = asyncio.create_task(monitor_loop())
+    briefing_task = asyncio.create_task(briefing_loop())
     await log_bot("🟢 Bot STARTED — Ascend Elite v3 active", "info")
     return {"status": "started"}
 
 
 @app.post("/stop")
 async def stop_bot():
-    global scan_task, monitor_task
+    global scan_task, monitor_task, briefing_task
     bot_state["running"] = False
-    for t in [scan_task, monitor_task]:
+    for t in [scan_task, monitor_task, briefing_task]:
         if t:
             t.cancel()
     await log_bot("🔴 Bot STOPPED", "warning")

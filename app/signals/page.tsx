@@ -6,6 +6,7 @@ import { BrainCircuit, Loader2, RefreshCw, Target, Zap } from "lucide-react";
 import { TradeBadge } from "@/components/ui/TradeBadge";
 import { SignalStrengthBar } from "@/components/ui/SignalStrengthBar";
 import { SignalCardSkeleton } from "@/components/ui/LoadingSkeleton";
+import { SignalDrawer } from "@/components/signals/SignalDrawer";
 import { useRealtime, useRealtimeSignals } from "@/hooks/useRealtime";
 import { createClient } from "@/lib/supabase/client";
 import { cn, formatPercent, pnlColor } from "@/lib/utils";
@@ -17,7 +18,7 @@ const GLOW = {
   HOLD: "",
 };
 
-function SignalCard({ signal, index }: { signal: Signal; index: number }) {
+function SignalCard({ signal, index, onClick }: { signal: Signal; index: number; onClick: () => void }) {
   const sig = signal.signal.toUpperCase() as "BUY" | "SELL" | "HOLD";
   const outcome = signal.signal_outcomes?.[0];
   const confidence = signal.confidence ?? signal.strength;
@@ -30,7 +31,8 @@ function SignalCard({ signal, index }: { signal: Signal; index: number }) {
       exit={{ opacity: 0, scale: 0.97 }}
       transition={{ delay: index * 0.04 }}
       layout
-      className={cn("glass rounded-2xl p-5", GLOW[sig])}
+      onClick={onClick}
+      className={cn("glass cursor-pointer rounded-2xl p-5 transition-transform hover:scale-[1.01]", GLOW[sig])}
     >
       {/* Top row */}
       <div className="mb-3 flex items-start justify-between">
@@ -120,6 +122,7 @@ export default function SignalsPage() {
   const [evaluating, setEvaluating] = useState(false);
   const [evalMessage, setEvalMessage] = useState<string | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [activeSignal, setActiveSignal] = useState<Signal | null>(null);
   const supabase = createClient();
 
   useEffect(() => {
@@ -195,6 +198,7 @@ export default function SignalsPage() {
 
   return (
     <div className="flex h-full flex-col overflow-y-auto">
+      <SignalDrawer signal={activeSignal} onClose={() => setActiveSignal(null)} />
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/[0.06] px-6 py-4">
         <div>
@@ -263,7 +267,7 @@ export default function SignalsPage() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
             <AnimatePresence>
               {signals.map((sig, i) => (
-                <SignalCard key={sig.id} signal={sig} index={i} />
+                <SignalCard key={sig.id} signal={sig} index={i} onClick={() => setActiveSignal(sig)} />
               ))}
             </AnimatePresence>
           </div>
